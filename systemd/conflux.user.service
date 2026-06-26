@@ -1,0 +1,25 @@
+# Per-user conflux daemon.
+#
+# Install:
+#   cp systemd/conflux.user.service ~/.config/systemd/user/conflux.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now conflux
+#
+# The `conflux` binary must be on the unit's PATH (e.g. ~/.cargo/bin, ~/.local/bin,
+# or /usr/local/bin). Use an absolute ExecStart path if it is not.
+
+[Unit]
+Description=conflux file-sync daemon (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CONFLUX_LOG=info
+ExecStart=conflux daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

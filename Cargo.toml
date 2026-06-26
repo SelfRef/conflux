@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/conflux-core", "crates/conflux"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["SelfRef"]
+repository = "https://github.com/SelfRef/conflux"
+rust-version = "1.85"
+
+[workspace.dependencies]
+conflux-core = { path = "crates/conflux-core" }
+
+# shared third-party deps
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+humantime = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+globset = "0.4"
+walkdir = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "io-util"] }
+notify = "6"
+notify-debouncer-full = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+quick-xml = "0.36"
+httpdate = "1"
+percent-encoding = "2"
+git2 = "0.19"
+
+[profile.release]
+strip = true
+lto = "thin"

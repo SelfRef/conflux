@@ -1,0 +1,60 @@
+# Example conflux configuration.
+#
+# Resolved automatically from:
+#   user mode:   $XDG_CONFIG_HOME/conflux/config.toml   (e.g. ~/.config/conflux/config.toml)
+#   system mode: /etc/conflux/config.toml
+# Override with $CONFLUX_CONFIG or `--config <path>`.
+
+[daemon]
+log_level = "info"
+debounce  = "2s"               # default watch debounce; overridable per remote/sync
+# active_profile = "desktop"   # run only syncs in this profile; unset = run all
+
+# ---------------------------------------------------------------------------
+# Remote connections
+# ---------------------------------------------------------------------------
+
+[[remote]]
+name = "nextcloud"
+type = "webdav"
+url  = "https://cloud.example.com/remote.php/dav/files/me/"
+username = "me"
+password = "secret"                          # plaintext (default)
+# password_command = "secret-tool lookup service conflux"   # optional alternative
+# debounce = "3s"                            # optional remote-level default
+
+[[remote]]
+name = "dotfiles"
+type = "git"
+url  = "https://github.com/me/dotfiles.git"
+# branch = "main"                            # optional; defaults to the remote's default branch
+# username / password / password_command    # optional, used for HTTPS git auth
+
+[[remote]]
+name = "local-mirror"
+type = "local"
+url  = "/mnt/backup/conflux"                 # mirror to another directory (great for testing)
+
+# ---------------------------------------------------------------------------
+# Sync groups: one local `root`, selective `include` for push, pull-all by default
+# ---------------------------------------------------------------------------
+
+[[sync]]
+remote      = "nextcloud"
+root        = "~/.config"
+remote_path = "config"
+direction   = "sync"           # "sync" (bidirectional, default) | "pull" (pull-only)
+include     = ["nvim", "fish", "kitty/kitty.conf"]   # ONLY these are pushed (default: all)
+pull_scope  = "all"            # "all" (default) | "include"
+trigger     = "watch"          # manual | timer | watch
+debounce    = "3s"             # optional override
+profiles    = ["desktop"]      # also a member of the implicit "default" profile
+# exclude   = []               # default: empty
+
+[[sync]]
+remote      = "dotfiles"
+root        = "~/.local/bin"
+remote_path = "bin"
+# include defaults to everything under root
+trigger     = "timer"
+# interval defaults to 1h when omitted

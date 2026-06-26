@@ -1,0 +1,33 @@
+# System-wide conflux daemon.
+#
+# Install:
+#   sudo cp target/release/conflux /usr/local/bin/conflux
+#   sudo useradd --system --create-home --home-dir /var/lib/conflux conflux
+#   sudo cp systemd/conflux.system.service /etc/systemd/system/conflux.service
+#   sudo cp config.example.toml /etc/conflux/config.toml   # then edit
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now conflux
+#
+# RuntimeDirectory/StateDirectory/ConfigurationDirectory create and own
+# /run/conflux, /var/lib/conflux, and /etc/conflux for the service user.
+
+[Unit]
+Description=conflux file-sync daemon (system)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CONFLUX_LOG=info
+ExecStart=/usr/local/bin/conflux --system daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+User=conflux
+Group=conflux
+RuntimeDirectory=conflux
+StateDirectory=conflux
+ConfigurationDirectory=conflux
+
+[Install]
+WantedBy=multi-user.target

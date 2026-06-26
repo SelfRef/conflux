@@ -1,0 +1,33 @@
+[package]
+name = "conflux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core library for conflux: config, model, sync engine, and backends."
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+directories = { workspace = true }
+humantime = { workspace = true }
+globset = { workspace = true }
+blake3 = { workspace = true }
+walkdir = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+quick-xml = { workspace = true }
+httpdate = { workspace = true }
+percent-encoding = { workspace = true }
+git2 = { workspace = true }
+libc = "0.2"
+shellexpand = "3"
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+git2 = { workspace = true }
