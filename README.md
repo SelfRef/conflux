@@ -146,4 +146,4 @@ CONFLUX_WEBDAV_URL=http://localhost:4918/ CONFLUX_WEBDAV_USER=test \
 
 ## License
 
-MIT
+GPLv3
