@@ -23,14 +23,14 @@ fn config(local: &Path, bare: &Path) -> Config {
     let toml = format!(
         r#"
         [[remote]]
-        name = "repo"
-        type = "git"
+        id = "repo"
+        backend = "git"
         url = "{bare}"
         branch = "main"
 
         [[sync]]
         remote = "repo"
-        root = "{local}"
+        local = "{local}"
         remote_path = "cfg"
         trigger = "manual"
         "#,
@@ -44,7 +44,46 @@ fn run(cfg: &Config, index: &mut Index, state: &Path) -> SyncReport {
     let sync = &cfg.syncs[0];
     let remote = cfg.remote(&sync.remote).unwrap();
     let backend = backend::build(remote, sync, state).expect("backend should build");
-    engine::sync_group(sync, backend.as_ref(), index).expect("sync should succeed")
+    engine::sync_group(sync, backend.as_ref(), index, false, conflux_core::model::EmptyDirMode::Ignore, conflux_core::model::PullScope::All, &[]).expect("sync should succeed")
+}
+
+#[test]
+fn commit_msg_command_customizes_the_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bare = tmp.path().join("remote.git");
+    seed_bare(&bare);
+    let root = tmp.path().join("a");
+    let state = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+
+    let toml = format!(
+        r#"
+        [[remote]]
+        id = "repo"
+        backend = "git"
+        url = "{bare}"
+        branch = "main"
+        commit_msg_command = "printf 'custom: %s' hello"
+
+        [[sync]]
+        remote = "repo"
+        local = "{local}"
+        remote_path = "cfg"
+        trigger = "manual"
+        "#,
+        bare = bare.display(),
+        local = root.display(),
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let mut index = Index::default();
+
+    fs::write(root.join("f.txt"), b"x").unwrap();
+    assert_eq!(run(&cfg, &mut index, &state).added.len(), 1);
+
+    // The pushed commit on the bare repo uses the command's output.
+    let repo = Repository::open_bare(&bare).unwrap();
+    let commit = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(commit.message().unwrap(), "custom: hello");
 }
 
 #[test]
@@ -66,30 +105,30 @@ fn git_round_trip_push_pull_update_delete() {
     // A creates a file -> commit + push.
     fs::write(root_a.join("app.conf"), b"v1").unwrap();
     let report = run(&cfg_a, &mut index_a, &state_a);
-    assert_eq!(report.pushed.len(), 1, "A pushes the new file");
+    assert_eq!(report.added.len(), 1, "A adds the new file");
 
     // B clones and pulls it.
     let report = run(&cfg_b, &mut index_b, &state_b);
-    assert_eq!(report.pulled.len(), 1, "B pulls the file");
+    assert_eq!(report.added.len(), 1, "B pulls the new file (added)");
     assert_eq!(fs::read_to_string(root_b.join("app.conf")).unwrap(), "v1");
 
     // A updates it -> new commit + push.
     fs::write(root_a.join("app.conf"), b"v2").unwrap();
     let report = run(&cfg_a, &mut index_a, &state_a);
-    assert_eq!(report.pushed.len(), 1, "A pushes the update");
+    assert_eq!(report.modified.len(), 1, "A pushes the update (modified)");
 
     // B pulls the update.
     let report = run(&cfg_b, &mut index_b, &state_b);
-    assert_eq!(report.pulled.len(), 1, "B pulls the update");
+    assert_eq!(report.modified.len(), 1, "B pulls the update (modified)");
     assert_eq!(fs::read_to_string(root_b.join("app.conf")).unwrap(), "v2");
 
     // A deletes it -> deletion is committed + pushed.
     fs::remove_file(root_a.join("app.conf")).unwrap();
     let report = run(&cfg_a, &mut index_a, &state_a);
-    assert_eq!(report.deleted_remote.len(), 1, "A deletes on the remote");
+    assert_eq!(report.removed.len(), 1, "A removes on the remote");
 
     // B sees the deletion and removes its local copy.
     let report = run(&cfg_b, &mut index_b, &state_b);
-    assert_eq!(report.deleted_local.len(), 1, "B deletes locally");
+    assert_eq!(report.removed.len(), 1, "B removes locally");
     assert!(!root_b.join("app.conf").exists());
 }

@@ -35,15 +35,15 @@ A minimal config:
 
 ```toml
 [[remote]]
-name = "nextcloud"
-type = "webdav"
+id = "nextcloud"
+backend = "webdav"
 url  = "https://cloud.example.com/remote.php/dav/files/me/"
 username = "me"
 password = "secret"            # or: password_command = "secret-tool lookup ..."
 
 [[sync]]
 remote      = "nextcloud"
-root        = "~/.config"      # one local root
+local       = "~/.config"      # one local root
 remote_path = "config"
 include     = ["nvim", "fish"] # only these are pushed (default: everything)
 trigger     = "watch"          # manual | timer | watch
@@ -63,39 +63,68 @@ conflux config paths      # show resolved config/state/socket paths
 # Foreground (for trying it out)
 conflux daemon
 
-# Or as a user service
+# Or as a user service (runs the "default" profile)
 cp systemd/conflux.user.service ~/.config/systemd/user/conflux.service
 systemctl --user daemon-reload
 systemctl --user enable --now conflux
 journalctl --user -u conflux -f
+
+# For another profile, use the template — the instance name is the profile
+cp systemd/conflux@.user.service ~/.config/systemd/user/conflux@.service
+systemctl --user enable --now conflux@desktop
 ```
 
-Control the running daemon:
+Control the running daemon (add `--profile <name>` to target a non-default
+instance, e.g. `conflux --profile desktop status`):
 
 ```sh
 conflux status                 # per-group last-run summary
-conflux sync                   # sync everything now
+conflux sync                   # sync every group this daemon runs
 conflux sync nextcloud:config  # sync one group (label is remote:remote_path)
-conflux sync --profile desktop # sync a profile
 conflux reload                 # re-read the config file (also: systemctl reload / SIGHUP)
 ```
 
+Each profile is a separate daemon with its own state dir and socket, so several
+(`conflux@desktop`, `conflux@laptop`, …) can run side by side on one host.
+
 ## Key concepts
 
-- **Sync group** — one local `root` mapped to a remote's `remote_path`. Its label
-  is `remote:remote_path`.
-- **`include` (push scope)** — globs (relative to `root`) selecting what is
-  *pushed*. Empty means everything. Pull always downloads the whole remote tree
-  unless `pull_scope = "include"`.
+- **Sync group** — one `local` root mapped to a remote's `remote_path` (optional;
+  omit it to map the remote's root). Its label is `remote:remote_path`, or just
+  `remote` when the path is the root.
+- **`include` (push scope)** — globs (relative to `local`) selecting what is
+  *pushed*, where `*` matches one path segment and `**` matches across segments
+  (a plain name includes its whole subtree). Empty means everything. Pull always
+  downloads the whole remote tree unless `pull_scope = "include"`.
+- **`exclude`** — globs never synced in either direction. A sync's `exclude` is
+  *added to* the `[daemon] exclude` list, which defaults to well-known cruft
+  (`.git`, `.svn`, `.hg`, `.DS_Store`, `Thumbs.db`, `*.swp`); set `[daemon]
+  exclude = []` to sync everything. Conflict copies are always excluded.
 - **`direction`** — `sync` (bidirectional, default) or `pull` (download only;
   local changes are never uploaded).
+- **`empty_dirs`** — how empty directories are handled (resolved per-sync →
+  per-remote → `[daemon]`): `ignore` (default, files only), `prune` (remove
+  empty dirs from both sides), or `mirror` (mirror empty dirs both ways, with
+  create/delete propagated via the index). Ignored for git remotes, which
+  cannot store empty directories.
 - **Conflicts (newer-wins)** — if a file changed on both sides, the newer mtime
   wins and the losing version is preserved next to it as
-  `name.conflux-conflict-<epoch>.ext` (and logged). These copies are never synced.
-- **Profiles** — tag groups with `profiles = ["desktop", ...]`. `daemon.active_profile`
-  selects which groups this host runs; unset/`default` runs all.
+  `name.conflux-conflict-YYYY-MM-DD_HH-MM-SS.ext` (local time; and logged). These
+  copies are never synced.
+- **Profiles** — tag groups with `profiles = ["desktop", ...]`; groups that omit
+  the setting belong to the implicit `"default"` profile. A host runs one profile,
+  selected (highest precedence first) by `conflux daemon --profile <name>`, then
+  `[daemon] profile`, defaulting to `"default"`. With systemd this is usually the
+  instance name: `conflux@desktop` runs the `desktop` profile, plain `conflux`
+  runs `default` — so one shared config drives different hosts.
 - **Triggers** — `manual` (only `conflux sync`), `timer` (`interval`, default 1h),
-  `watch` (inotify, debounced by `debounce`: per-sync → per-remote → daemon default 2s).
+  `watch` (inotify on the local tree, debounced by `debounce`: per-sync → daemon
+  default 5s), or `watch-both` (also watches the remote tree; requires a `local`
+  backend — config validation rejects it on webdav/git).
+- **`pull_interval`** — an *additional* periodic **pull-only** run (resolved per-sync
+  → per-remote → `[daemon]`, disabled when unset or `0`). Because `watch` only sees
+  local edits, set this to poll the remote for remote-side changes without waiting
+  for the next local change or full-sync tick.
 
 ## Architecture
 

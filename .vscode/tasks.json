@@ -1,0 +1,26 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build",
+			"type": "shell",
+			"command": "cargo",
+			"args": ["build"],
+			"problemMatcher": ["$rustc"],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"detail": "cargo build (whole workspace)"
+		},
+		{
+			"label": "run",
+			"type": "shell",
+			"command": "cargo",
+			"args": ["run", "--bin", "conflux", "--", "daemon"],
+			"problemMatcher": ["$rustc"],
+			"group": "none",
+			"detail": "cargo run -- daemon (foreground; Ctrl+C to stop)"
+		}
+	]
+}

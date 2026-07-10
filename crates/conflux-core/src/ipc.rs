@@ -19,15 +19,15 @@ pub enum Request {
     Reload,
 }
 
-/// Which groups a [`Request::Sync`] applies to.
+/// Which groups a [`Request::Sync`] applies to. Profile selection happens at the
+/// daemon level (each daemon serves one profile), so this only distinguishes
+/// "everything this daemon runs" from a single named group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncTarget {
     /// Every active group.
     All,
     /// A single group by its label (`remote:remote_path`).
     Group(String),
-    /// Every group belonging to the named profile.
-    Profile(String),
 }
 
 /// The daemon's reply.

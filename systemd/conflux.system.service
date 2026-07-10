@@ -1,4 +1,7 @@
-# System-wide conflux daemon.
+# System-wide conflux daemon (runs the implicit "default" profile).
+#
+# For any other profile, use the templated conflux@.system.service and enable
+# e.g. `conflux@desktop` — the instance name selects the profile.
 #
 # Install:
 #   sudo cp target/release/conflux /usr/local/bin/conflux

@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 directories = { workspace = true }
 humantime = { workspace = true }
+chrono = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 walkdir = { workspace = true }

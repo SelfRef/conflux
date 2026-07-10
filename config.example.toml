@@ -1,60 +1,223 @@
-# Example conflux configuration.
+# Example conflux configuration — reference of every option.
 #
 # Resolved automatically from:
 #   user mode:   $XDG_CONFIG_HOME/conflux/config.toml   (e.g. ~/.config/conflux/config.toml)
 #   system mode: /etc/conflux/config.toml
 # Override with $CONFLUX_CONFIG or `--config <path>`.
+#
+# Durations are humantime strings: "2s", "500ms", "3m", "1h", "0s" (= off).
+# Every option below is commented out and shown with its default value, so this
+# file documents the defaults without changing them — uncomment only what you
+# want to override. You need at least one [[remote]] and one [[sync]] for the
+# daemon to do anything.
 
-[daemon]
-log_level = "info"
-debounce  = "2s"               # default watch debounce; overridable per remote/sync
-# active_profile = "desktop"   # run only syncs in this profile; unset = run all
+# ===========================================================================
+# [daemon] — daemon-wide settings and the defaults inherited by remotes/syncs.
+# ===========================================================================
+# [daemon]
 
-# ---------------------------------------------------------------------------
-# Remote connections
-# ---------------------------------------------------------------------------
+# Tracing verbosity: "error" | "warn" | "info" | "debug" | "trace".
+# (The CONFLUX_LOG env var, if set, overrides this.)
+# log_level = "info"
 
-[[remote]]
-name = "nextcloud"
-type = "webdav"
-url  = "https://cloud.example.com/remote.php/dav/files/me/"
-username = "me"
-password = "secret"                          # plaintext (default)
-# password_command = "secret-tool lookup service conflux"   # optional alternative
-# debounce = "3s"                            # optional remote-level default
+# Default debounce for `watch` triggers: how long to wait for filesystem
+# activity to settle before syncing. Overridable per remote and per sync.
+# debounce = "5s"
 
-[[remote]]
-name = "dotfiles"
-type = "git"
-url  = "https://github.com/me/dotfiles.git"
-# branch = "main"                            # optional; defaults to the remote's default branch
-# username / password / password_command    # optional, used for HTTPS git auth
+# Default interval for `timer` triggers. Overridable per sync.
+# interval = "1h"
 
-[[remote]]
-name = "local-mirror"
-type = "local"
-url  = "/mnt/backup/conflux"                 # mirror to another directory (great for testing)
+# Default cadence for periodic remote pulls — an extra pull-only run that
+# catches remote-side changes (a `watch` trigger only sees LOCAL edits).
+# "0s" (or unset) disables it. Overridable per remote and per sync.
+# pull_interval = "0s"
 
-# ---------------------------------------------------------------------------
-# Sync groups: one local `root`, selective `include` for push, pull-all by default
-# ---------------------------------------------------------------------------
+# Default empty-directory handling. Overridable per remote and per sync.
+#   "ignore" — sync files only; leave empty directories untouched.
+#   "prune"  — remove empty directories from both sides after a sync.
+#   "mirror" — mirror empty directories to both sides (create + delete).
+# Ignored for git remotes, which cannot store empty directories.
+# empty_dirs = "ignore"
 
-[[sync]]
-remote      = "nextcloud"
-root        = "~/.config"
-remote_path = "config"
-direction   = "sync"           # "sync" (bidirectional, default) | "pull" (pull-only)
-include     = ["nvim", "fish", "kitty/kitty.conf"]   # ONLY these are pushed (default: all)
-pull_scope  = "all"            # "all" (default) | "include"
-trigger     = "watch"          # manual | timer | watch
-debounce    = "3s"             # optional override
-profiles    = ["desktop"]      # also a member of the implicit "default" profile
-# exclude   = []               # default: empty
+# Globs excluded from every sync, added to each sync's own `exclude` (and the
+# always-forced conflict-copy glob). Defaults to well-known VCS/OS cruft; set to
+# [] to sync everything.
+# exclude = ["**/.git/**", "**/.svn/**", "**/.hg/**", "**/.DS_Store", "**/Thumbs.db", "**/*.swp"]
 
-[[sync]]
-remote      = "dotfiles"
-root        = "~/.local/bin"
-remote_path = "bin"
-# include defaults to everything under root
-trigger     = "timer"
-# interval defaults to 1h when omitted
+# Which profile this host runs: only syncs whose `profiles` include this value
+# are active. "default" matches syncs that omit `profiles`. Usually left at
+# "default" and selected per-host via systemd (`conflux@desktop` runs the
+# "desktop" profile); `conflux --profile <name> daemon` overrides it and gives
+# each profile its own state dir + socket so instances can run in parallel.
+# profile = "default"
+
+# ===========================================================================
+# [[remote]] — a remote connection. Define one block per remote you sync with.
+# ===========================================================================
+# [[remote]]
+#
+# # Unique id, referenced by each [[sync]]'s `remote` field. (required)
+# id = "example"
+#
+# # Human-friendly label shown in UIs; purely descriptive. (optional)
+# label = "My Nextcloud"
+#
+# # Backend: "webdav" | "git" | "local". (required)
+# backend = "webdav"
+#
+# # Backend location. (required)
+# #   webdav → base URL, e.g. https://cloud.example.com/remote.php/dav/files/me/
+# #   git    → repository URL, e.g. https://github.com/me/dotfiles.git
+# #   local  → a directory path to mirror into, e.g. /mnt/backup/conflux
+# url = "https://cloud.example.com/remote.php/dav/files/me/"
+#
+# # Auth (optional): used by webdav and by git over HTTPS. Prefer
+# # `password_command` over a plaintext `password`. It runs via `sh -c` and its
+# # stdout is used as the password (trailing newline trimmed). Examples:
+# username = "me"
+# password = "secret"
+# password_command = "secret-tool lookup service conflux"   # from a keyring
+# password_command = 'printf %s "$CONFLUX_PASSWORD"'         # from an env var
+# # (For env vars under systemd, set them in the unit via Environment= or
+# #  EnvironmentFile=; a manually-run daemon inherits your shell environment.)
+#
+# # Git only (optional): branch to track; defaults to the remote's default branch.
+# branch = "main"
+#
+# # Git only (optional): command whose stdout becomes the commit message (run via
+# # `sh -c` in the clone, so it can inspect the staged index). Defaults to
+# # "conflux sync from <hostname>". Examples:
+# commit_msg_command = "printf 'sync from %s' \"$(hostname)\""
+# commit_msg_command = "git diff --cached --shortstat"
+#
+# # Remote-level defaults inherited by this remote's syncs (each optional; a
+# # per-sync value overrides these).
+# pull_scope = "all"           # "all" (default) | "include"
+# pull_interval = "10m"        # overrides the [daemon] default
+# empty_dirs = "mirror"        # overrides the [daemon] default
+
+# ===========================================================================
+# [[sync]] — a sync group: one local directory mapped to a path on a remote.
+# ===========================================================================
+# [[sync]]
+#
+# # Human-friendly label shown in UIs; purely descriptive. (optional)
+# label = "Config files"
+#
+# # Id of the [[remote]] this group syncs with. (required)
+# remote = "example"
+#
+# # Local root directory; leading `~` and $VARS are expanded. (required)
+# local = "~/.config"
+#
+# # Path under the remote that mirrors `local`. Omit (or "") to use the remote's
+# # root. Surrounding slashes are trimmed. (default: "")
+# remote_path = "config"
+#
+# # Sync direction: "sync" (bidirectional, newer-wins) or "pull" (download only;
+# # local changes are never uploaded). (default: "sync")
+# direction = "sync"
+#
+# # Push scope: globs (relative to `local`) selecting what may be pushed; empty
+# # means everything. `*` matches one path segment, `**` matches across
+# # segments, and a plain name includes its whole subtree. (default: [] = all)
+# include = ["nvim", "fish/*", "**/*.conf"]
+#
+# # Globs (relative to `local`) never synced in either direction. ADDED to the
+# # [daemon] `exclude` defaults, not replacing them. (default: [])
+# exclude = ["*.log", "cache/**"]
+#
+# # What pulls cover: "all" (the whole remote tree) or "include" (only the
+# # `include` globs). (default: inherits remote → "all")
+# pull_scope = "all"
+#
+# # How this group is triggered: "manual" (only `conflux sync`), "timer"
+# # (every `interval`), "watch" (on local file changes, debounced), or
+# # "watch-both" (like "watch" but also watches the remote side; requires a
+# # `local` backend — an error otherwise). (required)
+# trigger = "watch"
+#
+# # Timer interval for `trigger = "timer"`. (default: inherits [daemon] interval)
+# interval = "30m"
+#
+# # Watch debounce override. (default: inherits remote → [daemon] debounce)
+# debounce = "3s"
+#
+# # Periodic pull-only cadence to catch remote-side changes, independent of
+# # `trigger`. "0s" disables. (default: inherits remote → [daemon] pull_interval)
+# pull_interval = "5m"
+#
+# # Empty-directory handling: "ignore" | "prune" | "mirror". Ignored for git.
+# # (default: inherits remote → [daemon] empty_dirs)
+# empty_dirs = "mirror"
+#
+# # Profiles this group belongs to. Omit for the implicit ["default"]; an
+# # explicit list (even []) is used verbatim, with no implicit "default".
+# profiles = ["desktop"]
+
+# ===========================================================================
+# Examples — copy, uncomment, and adapt. Each shows a common setup; unset
+# options fall back to the defaults documented above.
+# ===========================================================================
+
+# --- Remotes, one per backend type -----------------------------------------
+
+# WebDAV (e.g. Nextcloud), password fetched from the secret store on demand.
+# [[remote]]
+# id = "nextcloud"
+# backend = "webdav"
+# url  = "https://cloud.example.com/remote.php/dav/files/me/"
+# username = "me"
+# password_command = "secret-tool lookup service conflux"
+
+# Git repository (e.g. a dotfiles repo) over SSH — auth via your ssh-agent.
+# [[remote]]
+# id = "dotfiles"
+# backend = "git"
+# url  = "git@github.com:me/dotfiles.git"
+# branch = "main"
+# commit_msg_command = "printf 'conflux: %s' \"$(hostname)\""
+
+# Local directory mirror — great for a backup disk or for testing.
+# [[remote]]
+# id = "backup"
+# backend = "local"
+# url  = "/mnt/backup/conflux"
+
+# --- Syncs ------------------------------------------------------------------
+
+# Live two-way sync of selected ~/.config subtrees to Nextcloud, reacting to
+# local edits and polling the remote every few minutes for changes made elsewhere.
+# [[sync]]
+# remote = "nextcloud"
+# local  = "~/.config"
+# remote_path = "config"
+# include = ["nvim", "fish", "kitty/kitty.conf"]
+# trigger = "watch"
+# pull_interval = "5m"
+
+# Dotfiles repo synced on a timer; empty directories kept on both sides.
+# (empty_dirs is ignored here anyway because the remote is git.)
+# [[sync]]
+# remote = "dotfiles"
+# local  = "~/.dotfiles"
+# trigger = "timer"
+# interval = "15m"
+
+# Pull-only mirror: download from the remote, never upload local changes.
+# [[sync]]
+# remote = "nextcloud"
+# local  = "~/Documents/shared"
+# remote_path = "shared"
+# direction = "pull"
+# trigger = "timer"
+
+# Full backup of ~/Documents to a local disk, pruning empty directories,
+# active only on the "desktop" profile.
+# [[sync]]
+# remote = "backup"
+# local  = "~/Documents"
+# remote_path = "documents"
+# trigger = "watch"
+# empty_dirs = "prune"
+# profiles = ["desktop"]

@@ -24,15 +24,15 @@ fn config(local: &Path, url: &str, user: &str, pass: &str) -> Config {
     let toml = format!(
         r#"
         [[remote]]
-        name = "dav"
-        type = "webdav"
+        id = "dav"
+        backend = "webdav"
         url = "{url}"
         username = "{user}"
         password = "{pass}"
 
         [[sync]]
         remote = "dav"
-        root = "{local}"
+        local = "{local}"
         remote_path = "conflux-test"
         trigger = "manual"
         "#,
@@ -46,7 +46,7 @@ fn run(cfg: &Config, index: &mut Index) -> engine::SyncReport {
     let remote = cfg.remote(&sync.remote).unwrap();
     let backend = backend::build(remote, sync, Path::new("/unused-for-webdav"))
         .expect("backend should build");
-    engine::sync_group(sync, backend.as_ref(), index).expect("sync should succeed")
+    engine::sync_group(sync, backend.as_ref(), index, false, conflux_core::model::EmptyDirMode::Ignore, conflux_core::model::PullScope::All, &[]).expect("sync should succeed")
 }
 
 #[test]
@@ -68,13 +68,13 @@ fn webdav_round_trip_push_pull_delete() {
     fs::create_dir_all(root_a.join("sub")).unwrap();
     fs::write(root_a.join("sub/notes.txt"), b"hello dav").unwrap();
     let report = run(&cfg_a, &mut index_a);
-    assert_eq!(report.pushed.len(), 1, "A should push one file");
+    assert_eq!(report.added.len(), 1, "A should add one file");
 
     // B (fresh) pulls the same remote path.
     let cfg_b = config(&root_b, &url, &user, &pass);
     let mut index_b = Index::default();
     let report = run(&cfg_b, &mut index_b);
-    assert_eq!(report.pulled.len(), 1, "B should pull one file");
+    assert_eq!(report.added.len(), 1, "B should pull one new file (added)");
     assert_eq!(
         fs::read_to_string(root_b.join("sub/notes.txt")).unwrap(),
         "hello dav"
@@ -83,10 +83,10 @@ fn webdav_round_trip_push_pull_delete() {
     // A deletes it; the delete should propagate to the remote.
     fs::remove_file(root_a.join("sub/notes.txt")).unwrap();
     let report = run(&cfg_a, &mut index_a);
-    assert_eq!(report.deleted_remote.len(), 1, "A should delete on remote");
+    assert_eq!(report.removed.len(), 1, "A should remove on remote");
 
     // B sees the remote deletion and removes its local copy.
     let report = run(&cfg_b, &mut index_b);
-    assert_eq!(report.deleted_local.len(), 1, "B should delete locally");
+    assert_eq!(report.removed.len(), 1, "B should remove locally");
     assert!(!root_b.join("sub/notes.txt").exists());
 }

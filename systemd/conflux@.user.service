@@ -1,0 +1,34 @@
+# Per-user conflux daemon, profile-templated.
+#
+# The systemd instance name selects the profile: `conflux@desktop` runs only
+# the syncs whose `profiles` include "desktop". This lets one shared config
+# file drive different profiles on different hosts. To run the implicit
+# "default" profile, use the plain (non-templated) conflux.user.service.
+#
+# Install:
+#   cp systemd/conflux@.user.service ~/.config/systemd/user/conflux@.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now conflux@desktop
+#
+# Multiple instances can run at once: each profile gets its own state
+# subdirectory and control socket (conflux-<profile>.sock). Target one with,
+# e.g., `conflux --profile desktop status`.
+#
+# The `conflux` binary must be on the unit's PATH (e.g. ~/.cargo/bin, ~/.local/bin,
+# or /usr/local/bin). Use an absolute ExecStart path if it is not.
+
+[Unit]
+Description=conflux file-sync daemon (user, profile %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CONFLUX_LOG=info
+ExecStart=conflux --profile %i daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

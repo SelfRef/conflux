@@ -41,16 +41,13 @@ pub fn print_response(response: &Response) -> bool {
             }
             for g in groups {
                 let when = match g.last_run {
-                    Some(secs) => format!("{}s since epoch", secs),
+                    Some(secs) => conflux_core::timefmt::local(secs),
                     None => "never".to_string(),
                 };
                 println!("{} [{}] root={}", g.label, g.trigger, g.root);
                 match (&g.last_summary, &g.last_error) {
                     (_, Some(err)) => println!("  last run: ERROR ({when}): {err}"),
-                    (Some(s), None) => println!(
-                        "  last run: {when} — {} pushed, {} pulled, {} del-local, {} del-remote, {} conflicts",
-                        s.pushed, s.pulled, s.deleted_local, s.deleted_remote, s.conflicts
-                    ),
+                    (Some(s), None) => println!("  last run: {when} — {s}"),
                     (None, None) => println!("  last run: {when}"),
                 }
             }
@@ -60,10 +57,7 @@ pub fn print_response(response: &Response) -> bool {
             let mut ok = true;
             for o in outcomes {
                 match (&o.summary, &o.error) {
-                    (Some(s), _) => println!(
-                        "{}: {} pushed, {} pulled, {} del-local, {} del-remote, {} conflicts",
-                        o.label, s.pushed, s.pulled, s.deleted_local, s.deleted_remote, s.conflicts
-                    ),
+                    (Some(s), _) => println!("{}: {s}", o.label),
                     (None, Some(err)) => {
                         ok = false;
                         println!("{}: ERROR: {err}", o.label);

@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::hash::hash_bytes;
 use crate::index::Index;
 use crate::matcher::Matcher;
-use crate::model::{Direction, FileMeta, PullScope};
+use crate::model::{Direction, EmptyDirMode, FileMeta, PullScope};
 use crate::relpath::RelPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,71 +38,117 @@ pub struct ConflictRecord {
     pub conflict_copy: PathBuf,
 }
 
-/// Summary of what a sync did.
+/// What a sync did, classified by outcome (not by direction). Files and empty
+/// directories are counted together: a newly-mirrored empty dir is `added`, a
+/// pruned one is `removed`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SyncReport {
-    /// Paths uploaded to the remote.
-    pub pushed: Vec<RelPath>,
-    /// Paths downloaded from the remote.
-    pub pulled: Vec<RelPath>,
-    /// Paths deleted locally.
-    pub deleted_local: Vec<RelPath>,
-    /// Paths deleted on the remote.
-    pub deleted_remote: Vec<RelPath>,
-    /// Conflicts that were resolved.
+    /// Files/dirs that newly appeared (no prior baseline) on either side.
+    pub added: Vec<RelPath>,
+    /// Files/dirs that were deleted on either side.
+    pub removed: Vec<RelPath>,
+    /// Existing files whose content changed on either side.
+    pub modified: Vec<RelPath>,
+    /// Conflicts that were resolved (kept as records so the preserved copy can
+    /// be logged).
     pub conflicts: Vec<ConflictRecord>,
 }
 
 impl SyncReport {
     /// Whether the sync changed anything at all.
     pub fn is_empty(&self) -> bool {
-        self.pushed.is_empty()
-            && self.pulled.is_empty()
-            && self.deleted_local.is_empty()
-            && self.deleted_remote.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.modified.is_empty()
             && self.conflicts.is_empty()
+    }
+
+    /// Record a written file/dir as `added` (no baseline) or `modified`.
+    fn record_write(&mut self, key: &RelPath, had_baseline: bool) {
+        if had_baseline {
+            self.modified.push(key.clone());
+        } else {
+            self.added.push(key.clone());
+        }
     }
 }
 
-/// Compact counts for a sync run, suitable for status display and IPC.
+/// Compact counts for a sync run, suitable for status display and IPC. Rendered
+/// as `+added -removed *modified ~conflicted`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SyncSummary {
-    /// Number of files pushed.
-    pub pushed: usize,
-    /// Number of files pulled.
-    pub pulled: usize,
-    /// Number of files deleted locally.
-    pub deleted_local: usize,
-    /// Number of files deleted on the remote.
-    pub deleted_remote: usize,
-    /// Number of conflicts resolved.
-    pub conflicts: usize,
+    /// Files/dirs added.
+    pub added: usize,
+    /// Files/dirs removed.
+    pub removed: usize,
+    /// Files modified.
+    pub modified: usize,
+    /// Conflicts resolved.
+    pub conflicted: usize,
+}
+
+impl std::fmt::Display for SyncSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "+{} -{} *{} ~{}",
+            self.added, self.removed, self.modified, self.conflicted
+        )
+    }
 }
 
 impl From<&SyncReport> for SyncSummary {
     fn from(r: &SyncReport) -> Self {
         SyncSummary {
-            pushed: r.pushed.len(),
-            pulled: r.pulled.len(),
-            deleted_local: r.deleted_local.len(),
-            deleted_remote: r.deleted_remote.len(),
-            conflicts: r.conflicts.len(),
+            added: r.added.len(),
+            removed: r.removed.len(),
+            modified: r.modified.len(),
+            conflicted: r.conflicts.len(),
         }
     }
 }
 
-/// A stable, human-readable label for a sync group (`remote:remote_path`).
+/// A stable, human-readable label for a sync group (`remote:remote_path`, or
+/// just `remote` when the group maps to the remote's root).
 pub fn group_label(sync: &Sync) -> String {
-    format!("{}:{}", sync.remote, sync.remote_path)
+    if sync.remote_path.is_empty() {
+        sync.remote.clone()
+    } else {
+        format!("{}:{}", sync.remote, sync.remote_path)
+    }
 }
 
 /// Convenience driver: build the backend, load the baseline index for `sync`
 /// from `state_dir`, run a sync, and persist the updated index.
-pub fn run(sync: &Sync, remote: &Remote, state_dir: &Path) -> Result<SyncReport> {
+///
+/// `remote_refresh` marks a periodic `pull_interval` poll: for a bidirectional
+/// group it applies only remote-originated changes and leaves local-side changes
+/// for the normal trigger, so it never fights the bidirectional reconcile.
+pub fn run(
+    sync: &Sync,
+    remote: &Remote,
+    state_dir: &Path,
+    remote_refresh: bool,
+    empty_dirs: EmptyDirMode,
+    exclude_defaults: &[String],
+) -> Result<SyncReport> {
     let backend = crate::backend::build(remote, sync, state_dir)?;
     let index_path = Index::path_for(state_dir, sync);
     let mut index = Index::load(&index_path)?;
-    let report = sync_group(sync, backend.as_ref(), &mut index)?;
+    // pull_scope resolves per-sync, then per-remote, then the `all` default.
+    let pull_scope = sync
+        .pull_scope
+        .or(remote.pull_scope)
+        .unwrap_or_default();
+    let report = sync_group(
+        sync,
+        backend.as_ref(),
+        &mut index,
+        remote_refresh,
+        empty_dirs,
+        pull_scope,
+        exclude_defaults,
+    )?;
     index.save(&index_path)?;
     Ok(report)
 }
@@ -142,11 +188,22 @@ enum Action {
 }
 
 /// Reconcile and apply one sync group against `backend`, updating `index`.
-pub fn sync_group(sync: &Sync, backend: &dyn Backend, index: &mut Index) -> Result<SyncReport> {
-    let exclude = Matcher::new(&sync.effective_excludes(), false)?;
+///
+/// When `remote_refresh` is set (a periodic `pull_interval` poll), bidirectional
+/// files only follow remote-originated changes; see [`decide_remote_refresh`].
+pub fn sync_group(
+    sync: &Sync,
+    backend: &dyn Backend,
+    index: &mut Index,
+    remote_refresh: bool,
+    empty_dirs: EmptyDirMode,
+    pull_scope: PullScope,
+    exclude_defaults: &[String],
+) -> Result<SyncReport> {
+    let exclude = Matcher::new(&sync.effective_excludes(exclude_defaults), false)?;
     let include = Matcher::new(&sync.include, true)?;
 
-    let local = scan_local(&sync.root, &exclude)?;
+    let local = scan_local(&sync.local, &exclude)?;
     let mut remote = backend.snapshot()?;
     remote.retain(|path, _| !exclude.is_match(path));
 
@@ -154,7 +211,7 @@ pub fn sync_group(sync: &Sync, backend: &dyn Backend, index: &mut Index) -> Resu
 
     for key in union_keys(&local, &remote, index) {
         let included = include.is_match(&key);
-        if sync.pull_scope == PullScope::Include && !included {
+        if pull_scope == PullScope::Include && !included {
             continue;
         }
         let pull_only = sync.direction == Direction::Pull || !included;
@@ -169,7 +226,11 @@ pub fn sync_group(sync: &Sync, backend: &dyn Backend, index: &mut Index) -> Resu
             base.as_ref().map(|b| b.remote_id.as_str()),
         );
 
-        let action = if pull_only {
+        let action = if remote_refresh && !pull_only {
+            // Bidirectional file during a background pull: apply only remote-side
+            // changes; leave local edits/deletes to the bidirectional trigger.
+            decide_remote_refresh(local_change, remote_change)
+        } else if pull_only {
             decide_pull_only(local_change, remote_change, local.contains_key(&key))
         } else {
             decide_bidir(local_change, remote_change)
@@ -184,11 +245,132 @@ pub fn sync_group(sync: &Sync, backend: &dyn Backend, index: &mut Index) -> Resu
             action,
             &local,
             &remote,
+            base.is_some(),
         )?;
+    }
+
+    // Empty-directory handling runs after files are applied (so emptiness
+    // reflects the just-synced tree) and only when the backend supports it.
+    if empty_dirs != EmptyDirMode::Ignore && backend.supports_empty_dirs() {
+        reconcile_dirs(sync, backend, index, &mut report, empty_dirs)?;
     }
 
     backend.finalize()?;
     Ok(report)
+}
+
+/// Handle empty directories after the file reconciliation, per `empty_dirs` mode.
+fn reconcile_dirs(
+    sync: &Sync,
+    backend: &dyn Backend,
+    index: &mut Index,
+    report: &mut SyncReport,
+    mode: EmptyDirMode,
+) -> Result<()> {
+    match mode {
+        EmptyDirMode::Ignore => Ok(()),
+        EmptyDirMode::Mirror => mirror_dirs(sync, backend, index, report),
+        EmptyDirMode::Prune => prune_dirs(sync, backend, report),
+    }
+}
+
+/// `mirror`: mirror empty directories to both sides and propagate their creation
+/// and deletion, using `index.dirs` as the baseline of previously-synced dirs.
+fn mirror_dirs(
+    sync: &Sync,
+    backend: &dyn Backend,
+    index: &mut Index,
+    report: &mut SyncReport,
+) -> Result<()> {
+    let local = crate::backend::walk_empty_dirs(&sync.local)?;
+    let remote = backend.snapshot_dirs()?;
+
+    let mut union: BTreeSet<RelPath> = BTreeSet::new();
+    union.extend(local.iter().cloned());
+    union.extend(remote.iter().cloned());
+    for d in &index.dirs {
+        if let Some(rel) = RelPath::from_relative(Path::new(d)) {
+            union.insert(rel);
+        }
+    }
+
+    for dir in union {
+        let lp = local.contains(&dir);
+        let rp = remote.contains(&dir);
+        let base = index.dirs.contains(dir.as_str());
+        match (lp, rp, base) {
+            // Present on both sides: ensure it stays tracked.
+            (true, true, _) => {
+                index.dirs.insert(dir.as_str().to_string());
+            }
+            // Newly created on one side: create on the other.
+            (true, false, false) => {
+                backend.create_dir(&dir)?;
+                index.dirs.insert(dir.as_str().to_string());
+                report.added.push(dir);
+            }
+            (false, true, false) => {
+                write_local_dir(&sync.local, &dir)?;
+                index.dirs.insert(dir.as_str().to_string());
+                report.added.push(dir);
+            }
+            // Deleted on one side (was synced): delete on the other.
+            (true, false, true) => {
+                remove_local_dir(&sync.local, &dir)?;
+                index.dirs.remove(dir.as_str());
+                report.removed.push(dir);
+            }
+            (false, true, true) => {
+                backend.remove_dir(&dir)?;
+                index.dirs.remove(dir.as_str());
+                report.removed.push(dir);
+            }
+            // Gone from both sides.
+            (false, false, _) => {
+                index.dirs.remove(dir.as_str());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `remove`: prune empty directories from both sides. Repeats until stable so a
+/// parent that becomes empty once its empty child is removed is pruned too.
+fn prune_dirs(sync: &Sync, backend: &dyn Backend, report: &mut SyncReport) -> Result<()> {
+    // Bound the passes by nesting depth; each pass removes at least the deepest
+    // empties, so a fixpoint is reached well within this many rounds.
+    for _ in 0..64 {
+        let mut removed_any = false;
+
+        for dir in crate::backend::walk_empty_dirs(&sync.local)? {
+            remove_local_dir(&sync.local, &dir)?;
+            report.removed.push(dir);
+            removed_any = true;
+        }
+        for dir in backend.snapshot_dirs()? {
+            backend.remove_dir(&dir)?;
+            report.removed.push(dir);
+            removed_any = true;
+        }
+
+        if !removed_any {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn write_local_dir(root: &Path, key: &RelPath) -> Result<()> {
+    std::fs::create_dir_all(key.to_local(root))?;
+    Ok(())
+}
+
+fn remove_local_dir(root: &Path, key: &RelPath) -> Result<()> {
+    match std::fs::remove_dir(key.to_local(root)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -201,8 +383,9 @@ fn apply(
     action: Action,
     local: &BTreeMap<RelPath, FileMeta>,
     remote: &crate::backend::RemoteSnapshot,
+    had_baseline: bool,
 ) -> Result<()> {
-    let root = &sync.root;
+    let root = &sync.local;
     match action {
         Action::Nothing => {}
         Action::DropIndex => index.remove(key),
@@ -210,29 +393,29 @@ fn apply(
         Action::Push | Action::ResurrectPush => {
             let meta = local.get(key).expect("push requires a local file");
             let data = std::fs::read(key.to_local(root))?;
-            let remote_meta = backend.write(key, &data)?;
+            let remote_meta = backend.write(key, &data, Some(meta.mtime))?;
             index.set(key, meta.hash.clone(), remote_meta.id);
-            report.pushed.push(key.clone());
+            report.record_write(key, had_baseline);
         }
 
         Action::Pull | Action::ResurrectPull => {
             let remote_meta = remote.get(key).expect("pull requires a remote file");
             let data = backend.read(key)?;
-            write_local(root, key, &data)?;
+            write_local(root, key, &data, remote_meta.mtime)?;
             index.set(key, hash_bytes(&data), remote_meta.id.clone());
-            report.pulled.push(key.clone());
+            report.record_write(key, had_baseline);
         }
 
         Action::DeleteLocal => {
             remove_local(root, key)?;
             index.remove(key);
-            report.deleted_local.push(key.clone());
+            report.removed.push(key.clone());
         }
 
         Action::DeleteRemote => {
             backend.remove(key)?;
             index.remove(key);
-            report.deleted_remote.push(key.clone());
+            report.removed.push(key.clone());
         }
 
         Action::Conflict => {
@@ -247,7 +430,7 @@ fn apply(
             } else if newer_is_local(local_meta, remote_meta) {
                 let copy = write_conflict_copy(root, key, &remote_data)?;
                 let local_data = std::fs::read(key.to_local(root))?;
-                let written = backend.write(key, &local_data)?;
+                let written = backend.write(key, &local_data, Some(local_meta.mtime))?;
                 index.set(key, local_meta.hash.clone(), written.id);
                 report.conflicts.push(ConflictRecord {
                     path: key.clone(),
@@ -257,7 +440,7 @@ fn apply(
             } else {
                 let local_data = std::fs::read(key.to_local(root))?;
                 let copy = write_conflict_copy(root, key, &local_data)?;
-                write_local(root, key, &remote_data)?;
+                write_local(root, key, &remote_data, remote_meta.mtime)?;
                 index.set(key, remote_hash, remote_meta.id.clone());
                 report.conflicts.push(ConflictRecord {
                     path: key.clone(),
@@ -272,6 +455,7 @@ fn apply(
             let remote_data = backend.read(key)?;
             let remote_hash = hash_bytes(&remote_data);
             let full = key.to_local(root);
+            let mut conflicted = false;
             if let Ok(local_data) = std::fs::read(&full) {
                 if hash_bytes(&local_data) != remote_hash {
                     let copy = write_conflict_copy(root, key, &local_data)?;
@@ -280,11 +464,16 @@ fn apply(
                         winner: Winner::Remote,
                         conflict_copy: copy,
                     });
+                    conflicted = true;
                 }
             }
-            write_local(root, key, &remote_data)?;
+            write_local(root, key, &remote_data, remote_meta.mtime)?;
             index.set(key, remote_hash, remote_meta.id.clone());
-            report.pulled.push(key.clone());
+            // If a divergent local copy was preserved it's a conflict; otherwise
+            // it's a plain pull counted as added/modified.
+            if !conflicted {
+                report.record_write(key, had_baseline);
+            }
         }
     }
     Ok(())
@@ -331,6 +520,23 @@ fn decide_bidir(local: Change, remote: Change) -> Action {
         (Created, Created) | (Modified, Modified) | (Created, Modified) | (Modified, Created) => {
             Action::Conflict
         }
+        _ => Action::Nothing,
+    }
+}
+
+/// Decide the action for a **remote-refresh** run: a periodic `pull_interval`
+/// poll of a bidirectional group. It applies only remote-originated changes and
+/// defers every local-side change to the normal bidirectional trigger — so a
+/// background pull can never resurrect a file the user just deleted locally
+/// (the bug where the first local delete was undone by a racing pull).
+fn decide_remote_refresh(local: Change, remote: Change) -> Action {
+    use Change::*;
+    match (local, remote) {
+        // Remote changed while local stayed put: bring the remote change down.
+        (Same, Modified) | (Gone, Created) => Action::Pull,
+        (Same, Removed) => Action::DeleteLocal,
+        // Local-side changes, or both sides changed: leave it to the
+        // bidirectional trigger (which pushes, deletes, or conflict-resolves).
         _ => Action::Nothing,
     }
 }
@@ -400,12 +606,18 @@ fn scan_local(root: &Path, exclude: &Matcher) -> Result<BTreeMap<RelPath, FileMe
     Ok(map)
 }
 
-fn write_local(root: &Path, key: &RelPath, data: &[u8]) -> Result<()> {
+fn write_local(root: &Path, key: &RelPath, data: &[u8], mtime: Option<SystemTime>) -> Result<()> {
     let full = key.to_local(root);
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&full, data)?;
+    // Preserve the remote's modification time so the copy matches 1:1.
+    if let Some(mtime) = mtime {
+        if let Ok(f) = std::fs::File::options().write(true).open(&full) {
+            let _ = f.set_modified(mtime);
+        }
+    }
     Ok(())
 }
 
@@ -418,12 +630,13 @@ fn remove_local(root: &Path, key: &RelPath) -> Result<()> {
     }
 }
 
-/// Write `data` next to the original file as `<stem>.conflux-conflict-<epoch><.ext>`.
+/// Write `data` next to the original file as
+/// `<stem>.conflux-conflict-YYYY-MM-DD_HH-MM-SS<.ext>`.
 fn write_conflict_copy(root: &Path, key: &RelPath, data: &[u8]) -> Result<PathBuf> {
     let full = key.to_local(root);
     let dir = full.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = full.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ts = now_secs();
+    let ts = crate::timefmt::stamp(now_secs());
     let name = match full.extension().and_then(|e| e.to_str()) {
         Some(ext) => format!("{stem}.conflux-conflict-{ts}.{ext}"),
         None => format!("{stem}.conflux-conflict-{ts}"),
@@ -439,4 +652,44 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Change::*;
+    use super::*;
+
+    #[test]
+    fn bidirectional_local_delete_propagates_to_remote() {
+        // The real (watch/timer/manual) trigger deletes a locally-removed file
+        // from the remote instead of resurrecting it.
+        assert_eq!(decide_bidir(Removed, Same), Action::DeleteRemote);
+    }
+
+    #[test]
+    fn remote_refresh_never_resurrects_a_local_delete() {
+        // Regression: a background `pull_interval` poll used to run pull-only,
+        // so (local Removed, remote Same) resolved to Pull and restored the file
+        // the user just deleted — undoing the pending bidirectional delete.
+        assert_eq!(decide_remote_refresh(Removed, Same), Action::Nothing);
+        // It also leaves other local-only changes alone.
+        assert_eq!(decide_remote_refresh(Modified, Same), Action::Nothing);
+        assert_eq!(decide_remote_refresh(Created, Gone), Action::Nothing);
+        // ...and defers both-sides-changed to the bidirectional trigger.
+        assert_eq!(decide_remote_refresh(Modified, Modified), Action::Nothing);
+    }
+
+    #[test]
+    fn remote_refresh_still_applies_remote_side_changes() {
+        assert_eq!(decide_remote_refresh(Same, Modified), Action::Pull);
+        assert_eq!(decide_remote_refresh(Gone, Created), Action::Pull);
+        assert_eq!(decide_remote_refresh(Same, Removed), Action::DeleteLocal);
+    }
+
+    #[test]
+    fn pull_only_group_still_restores_a_local_delete() {
+        // Unchanged behavior for genuinely pull-only groups: local is a mirror,
+        // so a deleted file is restored from the remote on the next pull.
+        assert_eq!(decide_pull_only(Removed, Same, false), Action::Pull);
+    }
 }

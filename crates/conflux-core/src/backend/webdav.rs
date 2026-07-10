@@ -13,6 +13,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::{Method, StatusCode, Url};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -200,7 +201,8 @@ impl Backend for WebdavBackend {
         Ok(resp.bytes().map_err(net_err)?.to_vec())
     }
 
-    fn write(&self, path: &RelPath, data: &[u8]) -> Result<RemoteMeta> {
+    // `_mtime` is ignored: the server assigns its own last-modified time.
+    fn write(&self, path: &RelPath, data: &[u8], _mtime: Option<SystemTime>) -> Result<RemoteMeta> {
         self.ensure_parents(path)?;
         let resp = self
             .method("PUT", self.url_for(path)?)
@@ -244,6 +246,92 @@ impl Backend for WebdavBackend {
 
     fn finalize(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn supports_empty_dirs(&self) -> bool {
+        true
+    }
+
+    fn snapshot_dirs(&self) -> Result<BTreeSet<RelPath>> {
+        let resp = self
+            .method("PROPFIND", self.base.clone())
+            .header("Depth", "infinity")
+            .header(reqwest::header::CONTENT_TYPE, "application/xml")
+            .body(PROPFIND_BODY)
+            .send()
+            .map_err(net_err)?;
+        let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(BTreeSet::new());
+        }
+        if status.as_u16() != 207 && !status.is_success() {
+            return Err(Error::Backend(format!("PROPFIND failed: {status}")));
+        }
+        let body = resp.text().map_err(net_err)?;
+
+        // Collect every resource's relative path, and which of them are
+        // collections. A collection is empty when no other path sits under it.
+        let mut all: Vec<String> = Vec::new();
+        let mut collections: Vec<String> = Vec::new();
+        for entry in parse_multistatus(&body)? {
+            let Some(rel) = rel_from_href(&self.base, &entry.href) else {
+                continue; // the group base itself
+            };
+            let s = rel.as_str().to_string();
+            if entry.is_collection {
+                collections.push(s.clone());
+            }
+            all.push(s);
+        }
+
+        let mut empty = BTreeSet::new();
+        for dir in collections {
+            let prefix = format!("{dir}/");
+            let has_child = all.iter().any(|p| *p != dir && p.starts_with(&prefix));
+            if !has_child {
+                if let Some(rel) = RelPath::from_relative(Path::new(&dir)) {
+                    empty.insert(rel);
+                }
+            }
+        }
+        Ok(empty)
+    }
+
+    fn create_dir(&self, path: &RelPath) -> Result<()> {
+        // MKCOL top-down: the remote_path segments, then every segment of `path`.
+        let mut segments: Vec<String> = self
+            .remote_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        segments.extend(path.as_str().split('/').map(str::to_string));
+
+        let mut url = self.root.clone();
+        for segment in &segments {
+            {
+                let mut seg = url
+                    .path_segments_mut()
+                    .map_err(|_| Error::Backend("base url cannot be a base".into()))?;
+                seg.pop_if_empty();
+                seg.push(segment);
+            }
+            self.mkcol(&url)?;
+        }
+        Ok(())
+    }
+
+    fn remove_dir(&self, path: &RelPath) -> Result<()> {
+        let resp = self
+            .method("DELETE", self.url_for(path)?)
+            .send()
+            .map_err(net_err)?;
+        let status = resp.status();
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(Error::Backend(format!("DELETE dir {path} failed: {status}")))
+        }
     }
 }
 

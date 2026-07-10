@@ -6,13 +6,14 @@
 //! synchronous engine never has two runs touching one group's index at once.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use conflux_core::config::{Remote, Sync};
+use conflux_core::model::{EmptyDirMode, RemoteKind};
 use conflux_core::engine::{self, group_label, SyncSummary};
 use conflux_core::ipc::{GroupOutcome, GroupStatus, Request, Response, SyncTarget};
 use conflux_core::{Config, Paths};
@@ -22,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Runtime status recorded per group (merged with static config for IPC).
 #[derive(Default, Clone)]
@@ -42,17 +43,40 @@ struct DaemonState {
 type Shared = Arc<Mutex<DaemonState>>;
 
 /// Submits sync jobs to the worker, coalescing duplicates already queued.
+///
+/// `queued` maps a label to whether its pending job is pull-only. A full sync
+/// supersedes a queued pull-only job for the same label, so background pulls
+/// never mask a real bidirectional run.
 #[derive(Clone)]
 struct Submitter {
     tx: mpsc::UnboundedSender<String>,
-    queued: Arc<Mutex<HashSet<String>>>,
+    queued: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl Submitter {
+    /// Queue a full (bidirectional, per the group's `direction`) sync.
     fn submit(&self, label: String) {
+        self.enqueue(label, false);
+    }
+
+    /// Queue a pull-only run (used by the periodic `pull_interval` trigger).
+    fn submit_pull(&self, label: String) {
+        self.enqueue(label, true);
+    }
+
+    fn enqueue(&self, label: String, pull_only: bool) {
         let mut queued = self.queued.lock().unwrap();
-        if queued.insert(label.clone()) {
-            let _ = self.tx.send(label);
+        match queued.get_mut(&label) {
+            // Already queued: upgrade a pull-only job to a full sync if needed.
+            Some(existing) => {
+                if !pull_only {
+                    *existing = false;
+                }
+            }
+            None => {
+                queued.insert(label.clone(), pull_only);
+                let _ = self.tx.send(label);
+            }
         }
     }
 }
@@ -95,7 +119,7 @@ async fn run_async(config: Config, paths: Paths) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     let submit = Submitter {
         tx,
-        queued: Arc::new(Mutex::new(HashSet::new())),
+        queued: Arc::new(Mutex::new(HashMap::new())),
     };
 
     // Single worker: drains the job queue, one sync at a time.
@@ -108,9 +132,22 @@ async fn run_async(config: Config, paths: Paths) -> anyhow::Result<()> {
 
     let mut triggers = spawn_triggers(&state, &submit);
 
-    // Sync every active group once at startup.
-    for label in active_labels(&state.lock().unwrap()) {
-        submit.submit(label);
+    // Sync every active group once at startup, warning if there is nothing to do.
+    {
+        let st = state.lock().unwrap();
+        let labels = active_labels(&st);
+        if labels.is_empty() {
+            if st.config.syncs.is_empty() {
+                warn!("no sync groups configured — add a [[remote]] and [[sync]] to the config; the daemon has nothing to do");
+            } else {
+                let profile = st.config.daemon.profile.as_deref().unwrap_or("default");
+                warn!(profile, "no sync groups active for this profile — check each sync's `profiles`; the daemon has nothing to do");
+            }
+        }
+        drop(st);
+        for label in labels {
+            submit.submit(label);
+        }
     }
 
     let listener = bind_socket(&socket_path)?;
@@ -165,14 +202,15 @@ async fn worker_loop(
     state: Shared,
     sync_lock: Arc<tokio::sync::Mutex<()>>,
     mut rx: mpsc::UnboundedReceiver<String>,
-    queued: Arc<Mutex<HashSet<String>>>,
+    queued: Arc<Mutex<HashMap<String, bool>>>,
 ) {
     while let Some(label) = rx.recv().await {
-        queued.lock().unwrap().remove(&label);
+        // A job queued only via `pull_interval` runs as a remote refresh.
+        let remote_refresh = queued.lock().unwrap().remove(&label).unwrap_or(false);
 
         // One attempt plus RETRY_BACKOFF.len() retries.
         for attempt in 0..=RETRY_BACKOFF.len() {
-            match run_one(&state, &sync_lock, &label).await {
+            match run_one(&state, &sync_lock, &label, remote_refresh).await {
                 Some(outcome) if outcome.error.is_some() => {
                     let err = outcome.error.unwrap();
                     if let Some(delay) = RETRY_BACKOFF.get(attempt) {
@@ -190,18 +228,38 @@ async fn worker_loop(
 }
 
 /// Resolve, run, and record one group's sync. Serialized by `sync_lock`.
+///
+/// `remote_refresh` marks a periodic `pull_interval` run: it only applies
+/// remote-side changes to a bidirectional group, so it never clobbers a pending
+/// local edit/delete that the group's own trigger will reconcile.
 async fn run_one(
     state: &Shared,
     sync_lock: &Arc<tokio::sync::Mutex<()>>,
     label: &str,
+    remote_refresh: bool,
 ) -> Option<GroupOutcome> {
-    let (sync, remote, state_dir) = {
+    let (sync, remote, state_dir, empty_dirs, exclude_defaults) = {
         let st = state.lock().unwrap();
-        resolve(&st, label)?
+        let (sync, remote, state_dir) = resolve(&st, label)?;
+        let empty_dirs = resolve_empty_dirs(&st.config, &sync);
+        let exclude_defaults = st.config.daemon.exclude.clone();
+        (sync, remote, state_dir, empty_dirs, exclude_defaults)
     };
 
     let _guard = sync_lock.lock().await;
-    let join = tokio::task::spawn_blocking(move || engine::run(&sync, &remote, &state_dir)).await;
+    let kind = if remote_refresh { "remote pull" } else { "sync" };
+    debug!(group = %label, "running {kind}");
+    let join = tokio::task::spawn_blocking(move || {
+        engine::run(
+            &sync,
+            &remote,
+            &state_dir,
+            remote_refresh,
+            empty_dirs,
+            &exclude_defaults,
+        )
+    })
+    .await;
 
     let (summary, error) = match join {
         Ok(Ok(report)) => {
@@ -209,9 +267,9 @@ async fn run_one(
                 warn!(group = %label, path = %c.path, "conflict resolved ({:?}); copy at {}", c.winner, c.conflict_copy.display());
             }
             if !report.is_empty() {
-                let s = SyncSummary::from(&report);
-                info!(group = %label, "synced: +{} -{} push, +{} -{} remote, {} conflicts",
-                    s.pushed, s.deleted_local, s.pulled, s.deleted_remote, s.conflicts);
+                info!(group = %label, "synced: {}", SyncSummary::from(&report));
+            } else {
+                debug!(group = %label, "{kind} complete, no changes");
             }
             (Some(SyncSummary::from(&report)), None)
         }
@@ -238,17 +296,33 @@ async fn run_one(
 fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
     let mut triggers = Triggers::default();
     let st = state.lock().unwrap();
-    let active_profile = st.config.daemon.active_profile.as_deref();
+    let active_profile = st.config.daemon.profile.as_deref();
 
     for sync in &st.config.syncs {
         if !is_active(sync, active_profile) {
             continue;
         }
         let label = group_label(sync);
+
+        // Git can't store empty directories, so `empty_dirs` has no effect there.
+        if resolve_empty_dirs(&st.config, sync) != EmptyDirMode::Ignore
+            && st.config.remote(&sync.remote).map(|r| r.backend) == Some(RemoteKind::Git)
+        {
+            warn!(
+                group = %label,
+                "`empty_dirs` is set but the remote is a git repo, which cannot \
+                 store empty directories; the setting is ignored for this group"
+            );
+        }
+
+        // Set when `watch-both` installs a live watcher on the remote side, so
+        // the periodic `pull_interval` poll below can be skipped as redundant.
+        let mut remote_watched = false;
+
         match sync.trigger {
             conflux_core::model::Trigger::Manual => {}
             conflux_core::model::Trigger::Timer => {
-                let interval = sync.effective_interval();
+                let interval = sync.effective_interval(st.config.daemon.interval);
                 let submit = submit.clone();
                 let label = label.clone();
                 triggers.tasks.push(tokio::spawn(async move {
@@ -262,14 +336,84 @@ fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
             }
             conflux_core::model::Trigger::Watch => {
                 let debounce = resolve_debounce(&st.config, sync);
-                match spawn_watch(&sync.root, debounce, submit.clone(), label.clone()) {
-                    Ok(watcher) => triggers.watchers.push(watcher),
-                    Err(e) => warn!(group = %label, "failed to watch {}: {e}", sync.root.display()),
+                install_watch(&mut triggers, &sync.local, debounce, &submit, &label, "local");
+            }
+            conflux_core::model::Trigger::WatchBoth => {
+                let debounce = resolve_debounce(&st.config, sync);
+                install_watch(&mut triggers, &sync.local, debounce, &submit, &label, "local");
+                // Also watch the remote's filesystem path. Config validation
+                // guarantees a `local` backend here, so this always applies.
+                if let Some(r) = st.config.remote(&sync.remote) {
+                    if r.backend == RemoteKind::Local {
+                        let remote_dir = conflux_core::backend::local::base_path(r, sync);
+                        install_watch(
+                            &mut triggers,
+                            &remote_dir,
+                            debounce,
+                            &submit,
+                            &label,
+                            "remote",
+                        );
+                        remote_watched = true;
+                    }
                 }
+            }
+        }
+
+        // Independent of `trigger`: periodically pull the remote to pick up
+        // remote-side changes. Disabled when unset or zero, and skipped when the
+        // remote is already watched live (`watch-both` on a local backend).
+        if remote_watched {
+            if resolve_pull_interval(&st.config, sync).is_some_and(|d| !d.is_zero()) {
+                debug!(group = %label, "ignoring pull_interval: the remote is already watched via watch-both");
+            }
+        } else if let Some(pull_interval) = resolve_pull_interval(&st.config, sync) {
+            if !pull_interval.is_zero() {
+                debug!(group = %label, ?pull_interval, "scheduling periodic remote pull");
+                let submit = submit.clone();
+                let label = label.clone();
+                triggers.tasks.push(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(pull_interval);
+                    tick.tick().await; // consume the immediate first tick
+                    loop {
+                        tick.tick().await;
+                        debug!(group = %label, "pull interval elapsed, queuing remote refresh");
+                        submit.submit_pull(label.clone());
+                    }
+                }));
             }
         }
     }
     triggers
+}
+
+/// Install a recursive watcher on `path`, pushing it into `triggers` on success
+/// or logging a clear warning on failure. `role` (`"local"`/`"remote"`) is used
+/// only in the messages.
+fn install_watch(
+    triggers: &mut Triggers,
+    path: &Path,
+    debounce: Duration,
+    submit: &Submitter,
+    label: &str,
+    role: &str,
+) {
+    match spawn_watch(path, debounce, submit.clone(), label.to_string()) {
+        Ok(watcher) => triggers.watchers.push(watcher),
+        Err(e) => {
+            let disp = path.display();
+            if !path.exists() {
+                warn!(
+                    group = %label,
+                    "not watching {role} directory `{disp}`: it does not exist. \
+                     Create it (or fix the config) and reload; this group will not \
+                     sync from that side until then",
+                );
+            } else {
+                warn!(group = %label, "not watching {role} directory `{disp}`: {e:#}");
+            }
+        }
+    }
 }
 
 /// Set up a debounced recursive watcher that submits the group on change.
@@ -290,7 +434,7 @@ fn spawn_watch(
     debouncer
         .watcher()
         .watch(root, RecursiveMode::Recursive)
-        .with_context(|| format!("watch {}", root.display()))?;
+        .context("register recursive watch")?;
     debouncer.cache().add_root(root, RecursiveMode::Recursive);
     Ok(Box::new(debouncer))
 }
@@ -350,7 +494,8 @@ async fn handle_conn(
             } else {
                 let mut outcomes = Vec::new();
                 for label in labels {
-                    if let Some(o) = run_one(state, sync_lock, &label).await {
+                    // Manual `conflux sync` always runs a full bidirectional sync.
+                    if let Some(o) = run_one(state, sync_lock, &label, false).await {
                         outcomes.push(o);
                     }
                 }
@@ -405,20 +550,36 @@ fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
 }
 
 fn resolve_debounce(config: &Config, sync: &Sync) -> Duration {
-    sync.debounce
-        .or_else(|| config.remote(&sync.remote).and_then(|r| r.debounce))
-        .unwrap_or(config.daemon.debounce)
+    sync.debounce.unwrap_or(config.daemon.debounce)
+}
+
+/// Resolve the periodic pull interval for a group: per-sync, then per-remote,
+/// then the daemon default. `None` (or a resolved zero) disables background
+/// pulling. The most specific level set wins, so a sync/remote can set `0` to
+/// opt out even when a broader level enables it.
+fn resolve_pull_interval(config: &Config, sync: &Sync) -> Option<Duration> {
+    sync.pull_interval
+        .or_else(|| config.remote(&sync.remote).and_then(|r| r.pull_interval))
+        .or(config.daemon.pull_interval)
+}
+
+/// Resolve empty-directory handling for a group: per-sync, then per-remote, then
+/// the daemon default.
+fn resolve_empty_dirs(config: &Config, sync: &Sync) -> EmptyDirMode {
+    sync.empty_dirs
+        .or_else(|| config.remote(&sync.remote).and_then(|r| r.empty_dirs))
+        .unwrap_or(config.daemon.empty_dirs)
 }
 
 fn is_active(sync: &Sync, active_profile: Option<&str>) -> bool {
     match active_profile {
-        None | Some("default") => true,
+        None => true,
         Some(profile) => sync.profiles.iter().any(|p| p == profile),
     }
 }
 
 fn active_labels(st: &DaemonState) -> Vec<String> {
-    let active_profile = st.config.daemon.active_profile.as_deref();
+    let active_profile = st.config.daemon.profile.as_deref();
     st.config
         .syncs
         .iter()
@@ -438,28 +599,24 @@ fn resolve(st: &DaemonState, label: &str) -> Option<(Sync, Remote, PathBuf)> {
     Some((sync, remote, st.paths.state.clone()))
 }
 
+/// Resolve a sync request to labels, always scoped to this daemon's active
+/// profile: `All` covers every group the daemon runs, `Group` picks one of them.
 fn labels_for_target(st: &DaemonState, target: &SyncTarget) -> Vec<String> {
-    match target {
-        SyncTarget::All => st.config.syncs.iter().map(group_label).collect(),
-        SyncTarget::Group(label) => st
-            .config
-            .syncs
-            .iter()
-            .map(group_label)
-            .filter(|l| l == label)
-            .collect(),
-        SyncTarget::Profile(profile) => st
-            .config
-            .syncs
-            .iter()
-            .filter(|s| s.profiles.iter().any(|p| p == profile))
-            .map(group_label)
-            .collect(),
-    }
+    let active_profile = st.config.daemon.profile.as_deref();
+    st.config
+        .syncs
+        .iter()
+        .filter(|s| is_active(s, active_profile))
+        .map(group_label)
+        .filter(|label| match target {
+            SyncTarget::All => true,
+            SyncTarget::Group(l) => label == l,
+        })
+        .collect()
 }
 
 fn status_list(st: &DaemonState) -> Vec<GroupStatus> {
-    let active_profile = st.config.daemon.active_profile.as_deref();
+    let active_profile = st.config.daemon.profile.as_deref();
     st.config
         .syncs
         .iter()
@@ -470,7 +627,7 @@ fn status_list(st: &DaemonState) -> Vec<GroupStatus> {
             GroupStatus {
                 label,
                 remote: s.remote.clone(),
-                root: s.root.display().to_string(),
+                root: s.local.display().to_string(),
                 trigger: format!("{:?}", s.trigger).to_lowercase(),
                 last_run: rt.last_run,
                 last_summary: rt.last_summary,
@@ -485,4 +642,111 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sync_named(config: &Config, remote_path: &str) -> Sync {
+        config
+            .syncs
+            .iter()
+            .find(|s| s.remote_path == remote_path)
+            .expect("sync present")
+            .clone()
+    }
+
+    #[test]
+    fn pull_interval_resolves_sync_then_remote_then_daemon() {
+        let config = Config::from_toml_str(
+            r#"
+            [daemon]
+            pull_interval = "1h"
+
+            [[remote]]
+            id = "a"
+            backend = "local"
+            url = "/tmp/a"
+
+            [[remote]]
+            id = "b"
+            backend = "local"
+            url = "/tmp/b"
+            pull_interval = "10m"
+
+            [[sync]]
+            remote = "a"
+            local = "/tmp/la"
+            remote_path = "inherit-daemon"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "b"
+            local = "/tmp/lb"
+            remote_path = "inherit-remote"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "b"
+            local = "/tmp/lc"
+            remote_path = "own"
+            trigger = "manual"
+            pull_interval = "5m"
+
+            [[sync]]
+            remote = "a"
+            local = "/tmp/ld"
+            remote_path = "opt-out"
+            trigger = "manual"
+            pull_interval = "0s"
+        "#,
+        )
+        .unwrap();
+
+        // No override anywhere but the daemon default.
+        assert_eq!(
+            resolve_pull_interval(&config, &sync_named(&config, "inherit-daemon")),
+            Some(Duration::from_secs(3600))
+        );
+        // Remote-level default beats the daemon default.
+        assert_eq!(
+            resolve_pull_interval(&config, &sync_named(&config, "inherit-remote")),
+            Some(Duration::from_secs(600))
+        );
+        // Per-sync value wins over everything.
+        assert_eq!(
+            resolve_pull_interval(&config, &sync_named(&config, "own")),
+            Some(Duration::from_secs(300))
+        );
+        // A per-sync zero opts out even though the daemon default is set; the
+        // spawn loop treats a resolved zero as "disabled".
+        assert_eq!(
+            resolve_pull_interval(&config, &sync_named(&config, "opt-out")),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn pull_interval_disabled_when_unset_anywhere() {
+        let config = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "a"
+            backend = "local"
+            url = "/tmp/a"
+
+            [[sync]]
+            remote = "a"
+            local = "/tmp/la"
+            remote_path = "x"
+            trigger = "watch"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_pull_interval(&config, &sync_named(&config, "x")),
+            None
+        );
+    }
 }

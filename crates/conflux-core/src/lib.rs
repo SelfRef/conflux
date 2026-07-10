@@ -14,6 +14,7 @@ pub mod matcher;
 pub mod model;
 pub mod paths;
 pub mod relpath;
+pub mod timefmt;
 
 pub use config::Config;
 pub use error::{Error, Result};

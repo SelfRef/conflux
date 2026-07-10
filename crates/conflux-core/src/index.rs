@@ -23,6 +23,10 @@ pub struct IndexEntry {
 pub struct Index {
     /// Per-file baseline entries.
     pub entries: BTreeMap<String, IndexEntry>,
+    /// Empty directories known to be synced at the last run (only populated in
+    /// `empty_dirs = mirror` mode; used to propagate empty-dir deletions).
+    #[serde(default)]
+    pub dirs: std::collections::BTreeSet<String>,
 }
 
 impl Index {

@@ -1,4 +1,7 @@
-# Per-user conflux daemon.
+# Per-user conflux daemon (runs the implicit "default" profile).
+#
+# For any other profile, use the templated conflux@.user.service and enable
+# e.g. `conflux@desktop` — the instance name selects the profile.
 #
 # Install:
 #   cp systemd/conflux.user.service ~/.config/systemd/user/conflux.service

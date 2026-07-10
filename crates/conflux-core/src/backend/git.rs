@@ -31,12 +31,13 @@ pub struct GitBackend {
     branch: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    commit_msg_command: Option<String>,
 }
 
 impl GitBackend {
     /// Build the backend, resolving credentials (may run `password_command`).
     pub fn new(remote: &Remote, sync: &Sync, state_dir: &Path) -> Result<Self> {
-        let repo_dir = state_dir.join("git").join(sanitize(&remote.name));
+        let repo_dir = state_dir.join("git").join(sanitize(&remote.id));
         let mut base = repo_dir.clone();
         for part in sync.remote_path.split('/').filter(|s| !s.is_empty()) {
             base.push(part);
@@ -48,6 +49,39 @@ impl GitBackend {
             branch: remote.branch.clone(),
             username: remote.username.clone(),
             password: remote.resolve_password()?,
+            commit_msg_command: remote.commit_msg_command.clone(),
+        })
+    }
+
+    /// The commit message: `commit_msg_command`'s stdout (run via `sh -c` in the
+    /// clone, so it can inspect the staged index), else the default
+    /// `"conflux sync from <hostname>"`.
+    fn commit_message(&self) -> Result<String> {
+        let Some(cmd) = &self.commit_msg_command else {
+            return Ok(default_commit_message());
+        };
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(&self.repo_dir)
+            .output()
+            .map_err(|e| Error::Backend(format!("commit_msg_command failed to run: {e}")))?;
+        if !output.status.success() {
+            return Err(Error::Backend(format!(
+                "commit_msg_command exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let msg = String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\n', '\r'])
+            .to_string();
+        // A git commit message must not be empty; fall back if the command
+        // produced nothing.
+        Ok(if msg.is_empty() {
+            default_commit_message()
+        } else {
+            msg
         })
     }
 
@@ -144,7 +178,8 @@ impl Backend for GitBackend {
         Ok(std::fs::read(self.full(path))?)
     }
 
-    fn write(&self, path: &RelPath, data: &[u8]) -> Result<RemoteMeta> {
+    // `_mtime` is ignored: git stores no per-file mtime (it uses commit time).
+    fn write(&self, path: &RelPath, data: &[u8], _mtime: Option<SystemTime>) -> Result<RemoteMeta> {
         let full = self.full(path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
@@ -191,7 +226,8 @@ impl Backend for GitBackend {
         let tree = repo.find_tree(tree_oid).map_err(gerr("find tree"))?;
         let sig = Signature::now("conflux", "conflux@localhost").map_err(gerr("signature"))?;
         let parents: Vec<&git2::Commit> = parent.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, "conflux sync", &tree, &parents)
+        let message = self.commit_message()?;
+        repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &parents)
             .map_err(gerr("commit"))?;
 
         let branch = self.branch_name(&repo);
@@ -218,4 +254,27 @@ fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// Default commit message, tagged with this host so a shared repo shows which
+/// machine pushed. Falls back to a plain message if the hostname is unavailable.
+fn default_commit_message() -> String {
+    match hostname() {
+        Some(h) => format!("conflux sync from {h}"),
+        None => "conflux sync".to_string(),
+    }
+}
+
+/// The system hostname via `gethostname(2)`, or `None` on failure.
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes into `buf` and, on
+    // success, NUL-terminates when there is room.
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+    (!name.is_empty()).then_some(name)
 }

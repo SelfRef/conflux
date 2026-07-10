@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::hash::hash_bytes;
 use crate::model::RemoteMeta;
 use crate::relpath::RelPath;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -30,19 +30,69 @@ pub trait Backend: Send {
     fn snapshot(&self) -> Result<RemoteSnapshot>;
     /// Read a file's bytes.
     fn read(&self, path: &RelPath) -> Result<Vec<u8>>;
-    /// Create or overwrite a file, returning its new metadata.
-    fn write(&self, path: &RelPath, data: &[u8]) -> Result<RemoteMeta>;
+    /// Create or overwrite a file, returning its new metadata. `mtime`, when
+    /// given, is the source file's modification time; backends that can preserve
+    /// it (the local mirror) should, for a 1:1 copy. Others may ignore it.
+    fn write(&self, path: &RelPath, data: &[u8], mtime: Option<SystemTime>) -> Result<RemoteMeta>;
     /// Delete a file.
     fn remove(&self, path: &RelPath) -> Result<()>;
     /// Commit/flush the batch of writes performed since the last finalize.
     fn finalize(&self) -> Result<()>;
+
+    /// Whether this backend can represent empty directories. Git cannot (it only
+    /// tracks files), so it returns `false` and the engine skips `empty_dirs`.
+    fn supports_empty_dirs(&self) -> bool {
+        false
+    }
+
+    /// The set of *empty* directories under the remote path. Only meaningful when
+    /// [`Backend::supports_empty_dirs`] is true.
+    fn snapshot_dirs(&self) -> Result<BTreeSet<RelPath>> {
+        Ok(BTreeSet::new())
+    }
+
+    /// Create an empty directory (and any missing parents) at `path`.
+    fn create_dir(&self, _path: &RelPath) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove the (expected-empty) directory at `path`.
+    fn remove_dir(&self, _path: &RelPath) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Walk `base` and return every *empty* subdirectory as a `RelPath` (the base
+/// itself is never included). A directory is empty when it contains no entries.
+pub(crate) fn walk_empty_dirs(base: &Path) -> Result<BTreeSet<RelPath>> {
+    let mut dirs = BTreeSet::new();
+    if !base.exists() {
+        return Ok(dirs);
+    }
+    for entry in walkdir::WalkDir::new(base).follow_links(false) {
+        let entry = entry.map_err(std::io::Error::from)?;
+        if !entry.file_type().is_dir() || entry.path() == base {
+            continue;
+        }
+        if entry.path().components().any(|c| c.as_os_str() == ".git") {
+            continue;
+        }
+        let is_empty = std::fs::read_dir(entry.path())?.next().is_none();
+        if !is_empty {
+            continue;
+        }
+        if let Some(rel) = RelPath::from_base(base, entry.path()) {
+            dirs.insert(rel);
+        }
+    }
+    Ok(dirs)
 }
 
 /// Construct a backend for `sync` against its `remote`. `state_dir` is where
 /// backends that need local working state (git clones) keep it.
 pub fn build(remote: &Remote, sync: &Sync, state_dir: &Path) -> Result<Box<dyn Backend>> {
     use crate::model::RemoteKind;
-    match remote.kind {
+    match remote.backend {
         RemoteKind::Local => Ok(Box::new(local::LocalBackend::new(remote, sync))),
         RemoteKind::Webdav => Ok(Box::new(webdav::WebdavBackend::new(remote, sync)?)),
         RemoteKind::Git => Ok(Box::new(git::GitBackend::new(remote, sync, state_dir)?)),

@@ -1,17 +1,29 @@
 //! TOML configuration schema, loading, normalization, and validation.
 
 use crate::error::{Error, Result};
-use crate::model::{Direction, PullScope, RemoteKind, Trigger};
+use crate::model::{Direction, EmptyDirMode, PullScope, RemoteKind, Trigger};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Glob force-added to every group's excludes so conflict copies never re-sync.
-pub const CONFLICT_GLOB: &str = "*.conflux-conflict-*";
+/// The leading `**/` matches conflict copies at any depth, not just the root.
+pub const CONFLICT_GLOB: &str = "**/*.conflux-conflict-*";
+
+/// Well-known paths excluded by default (the `[daemon] exclude` default): VCS
+/// metadata and common OS/editor cruft that should almost never be synced.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "**/.git/**",
+    "**/.svn/**",
+    "**/.hg/**",
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/*.swp",
+];
 
 /// Default watch debounce when none is configured at any level.
-pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(2);
+pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// Default timer interval when a `timer` sync omits `interval`.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -45,9 +57,32 @@ pub struct DaemonConfig {
         serialize_with = "se::duration"
     )]
     pub debounce: Duration,
-    /// Active profile for this host; `None`/`"default"` means "run every sync".
+    /// Default timer interval, overridable per sync.
+    #[serde(
+        default = "default_interval",
+        deserialize_with = "de::duration",
+        serialize_with = "se::duration"
+    )]
+    pub interval: Duration,
+    /// Default interval for periodic remote pulls, overridable per remote/sync.
+    /// `None` (unset) disables background pulling; `0` also disables it (handy to
+    /// opt a single group out when a broader level enables it).
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub pull_interval: Option<Duration>,
+    /// Default empty-directory handling, overridable per remote/sync.
     #[serde(default)]
-    pub active_profile: Option<String>,
+    pub empty_dirs: EmptyDirMode,
+    /// Globs excluded from every sync (in addition to each sync's own `exclude`
+    /// and the always-forced conflict-copy glob). Defaults to well-known cruft
+    /// like `.git`; set to `[]` to sync everything.
+    #[serde(default = "default_exclude")]
+    pub exclude: Vec<String>,
+    /// Active profile for this host; defaults to `"default"` when unset. Only
+    /// syncs whose `profiles` include this value run, so the default runs the
+    /// syncs that omitted the `profiles` setting. A programmatic `None` runs
+    /// every sync (not reachable from config).
+    #[serde(default = "default_profile")]
+    pub profile: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -55,7 +90,11 @@ impl Default for DaemonConfig {
         DaemonConfig {
             log_level: default_log_level(),
             debounce: DEFAULT_DEBOUNCE,
-            active_profile: None,
+            interval: DEFAULT_INTERVAL,
+            pull_interval: None,
+            empty_dirs: EmptyDirMode::default(),
+            exclude: default_exclude(),
+            profile: default_profile(),
         }
     }
 }
@@ -64,11 +103,13 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
-    /// Unique name referenced by sync groups.
-    pub name: String,
+    /// Unique id referenced by sync groups (each sync's `remote` field).
+    pub id: String,
+    /// Optional human-friendly label for UIs; not used by the daemon.
+    #[serde(default)]
+    pub label: Option<String>,
     /// Backend kind.
-    #[serde(rename = "type")]
-    pub kind: RemoteKind,
+    pub backend: RemoteKind,
     /// Backend URL (WebDAV base / git remote / local path).
     pub url: String,
     /// Optional username for auth.
@@ -83,30 +124,50 @@ pub struct Remote {
     /// Git branch; defaults to the remote's default branch when omitted.
     #[serde(default)]
     pub branch: Option<String>,
-    /// Remote-level default watch debounce.
+    /// Git only (optional): command whose stdout is used as the commit message
+    /// (run via `sh -c` in the clone directory). Defaults to `"conflux sync"`.
+    #[serde(default)]
+    pub commit_msg_command: Option<String>,
+    /// Remote-level default pull scope (overridden per sync). See
+    /// [`Sync::pull_scope`].
+    #[serde(default)]
+    pub pull_scope: Option<PullScope>,
+    /// Remote-level default for periodic remote pulls (overrides the daemon
+    /// default; overridden per sync). See [`DaemonConfig::pull_interval`].
     #[serde(default, deserialize_with = "de::opt_duration")]
-    pub debounce: Option<Duration>,
+    pub pull_interval: Option<Duration>,
+    /// Remote-level empty-directory handling (overrides the daemon default;
+    /// overridden per sync). Ignored for git remotes, which cannot store them.
+    #[serde(default)]
+    pub empty_dirs: Option<EmptyDirMode>,
 }
 
 /// A sync group: one local root mapped to a remote path.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sync {
-    /// Name of the remote this group syncs with.
+    /// Optional human-friendly label for UIs; not used by the daemon.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Id of the remote this group syncs with (matches a `[[remote]]` `id`).
     pub remote: String,
     /// Single local root directory (tilde/env expanded on load).
-    pub root: PathBuf,
-    /// Path under the remote that mirrors `root`.
+    pub local: PathBuf,
+    /// Path under the remote that mirrors `local`. Optional; when omitted (or
+    /// empty) the group maps to the remote's root. Normalized to drop
+    /// surrounding slashes on load.
+    #[serde(default)]
     pub remote_path: String,
     /// Sync direction: bidirectional (`sync`, default) or `pull` only.
     #[serde(default)]
     pub direction: Direction,
-    /// Glob paths (relative to `root`) eligible for push; empty means "all".
+    /// Glob paths (relative to `local`) eligible for push; empty means "all".
     #[serde(default)]
     pub include: Vec<String>,
-    /// Whether pulls cover the whole remote tree or only `include`.
+    /// Whether pulls cover the whole remote tree or only `include`. Overrides
+    /// the remote-level default; falls back to `all` when unset everywhere.
     #[serde(default)]
-    pub pull_scope: PullScope,
+    pub pull_scope: Option<PullScope>,
     /// How this group is triggered.
     pub trigger: Trigger,
     /// Timer interval; defaults to one hour when `trigger = "timer"`.
@@ -115,10 +176,23 @@ pub struct Sync {
     /// Watch debounce override.
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub debounce: Option<Duration>,
-    /// Profiles this group belongs to (in addition to the implicit `default`).
+    /// Periodic remote-pull interval for this group (overrides the remote/daemon
+    /// default). Independent of `trigger`: it adds a pull-only run every interval
+    /// so remote-side changes are picked up even for `watch`/`manual` groups.
+    /// See [`DaemonConfig::pull_interval`].
+    #[serde(default, deserialize_with = "de::opt_duration")]
+    pub pull_interval: Option<Duration>,
+    /// Empty-directory handling for this group (overrides the remote/daemon
+    /// default): `ignore` (default), `prune`, or `keep`. Ignored for git.
     #[serde(default)]
+    pub empty_dirs: Option<EmptyDirMode>,
+    /// Profiles this group belongs to. When the setting is omitted it defaults
+    /// to the implicit `["default"]`; an explicit list (even empty) is used
+    /// verbatim, without any implicit `default` membership.
+    #[serde(default = "default_profiles")]
     pub profiles: Vec<String>,
-    /// Glob paths (relative to `root`) excluded from sync.
+    /// Glob paths (relative to `local`) excluded from sync, *added to* the
+    /// `[daemon] exclude` defaults (they are not replaced).
     #[serde(default)]
     pub exclude: Vec<String>,
 }
@@ -144,32 +218,70 @@ impl Config {
         Ok(config)
     }
 
-    /// Expand `~`/env vars in local roots in place.
+    /// Expand `~`/env vars in local roots and trim slashes off remote paths.
     fn normalize(&mut self) {
         for sync in &mut self.syncs {
-            sync.root = expand_path(&sync.root);
+            sync.local = expand_path(&sync.local);
+            // An empty / all-slashes `remote_path` means "the remote root".
+            let trimmed = sync.remote_path.trim_matches('/');
+            if trimmed.len() != sync.remote_path.len() {
+                sync.remote_path = trimmed.to_string();
+            }
         }
     }
 
     /// Check cross-field invariants. Returns the first problem found.
     pub fn validate(&self) -> Result<()> {
-        let mut names = HashSet::new();
+        let mut ids = HashSet::new();
         for remote in &self.remotes {
-            if !names.insert(remote.name.as_str()) {
+            if !ids.insert(remote.id.as_str()) {
                 return Err(Error::Validation(format!(
-                    "duplicate remote name `{}`",
-                    remote.name
+                    "duplicate remote id `{}`",
+                    remote.id
+                )));
+            }
+            if remote.commit_msg_command.is_some() && remote.backend != RemoteKind::Git {
+                return Err(Error::Validation(format!(
+                    "remote `{}` sets `commit_msg_command`, which only applies to a `git` \
+                     backend, but its backend is `{}`",
+                    remote.id,
+                    remote.backend.as_str(),
                 )));
             }
         }
 
+        let mut labels = HashSet::new();
         for sync in &self.syncs {
-            if !names.contains(sync.remote.as_str()) {
+            if !ids.contains(sync.remote.as_str()) {
                 return Err(Error::Validation(format!(
                     "sync for `{}` references unknown remote `{}`",
-                    sync.root.display(),
+                    sync.local.display(),
                     sync.remote
                 )));
+            }
+            // Two groups sharing a (remote, remote_path) collide on their state
+            // index; catch it here (easy to hit now that `remote_path` is optional).
+            let label = crate::engine::group_label(sync);
+            if !labels.insert(label.clone()) {
+                return Err(Error::Validation(format!(
+                    "duplicate sync group `{label}` (same remote and remote_path)"
+                )));
+            }
+            // `watch-both` watches the remote's filesystem path, which only a
+            // `local` backend has — reject it up front rather than silently
+            // degrading to a local-only watch.
+            if sync.trigger == Trigger::WatchBoth {
+                if let Some(remote) = self.remote(&sync.remote) {
+                    if remote.backend != RemoteKind::Local {
+                        return Err(Error::Validation(format!(
+                            "sync `{label}` uses `trigger = \"watch-both\"`, which requires a \
+                             `local` backend, but remote `{}` is `{}`; use `trigger = \"watch\"` \
+                             (optionally with `pull_interval`) instead",
+                            sync.remote,
+                            remote.backend.as_str(),
+                        )));
+                    }
+                }
             }
             for pattern in sync.include.iter().chain(&sync.exclude) {
                 globset::Glob::new(pattern)
@@ -180,9 +292,9 @@ impl Config {
         Ok(())
     }
 
-    /// Look up a remote by name.
-    pub fn remote(&self, name: &str) -> Option<&Remote> {
-        self.remotes.iter().find(|r| r.name == name)
+    /// Look up a remote by its id.
+    pub fn remote(&self, id: &str) -> Option<&Remote> {
+        self.remotes.iter().find(|r| r.id == id)
     }
 }
 
@@ -213,21 +325,27 @@ impl Remote {
 }
 
 impl Sync {
-    /// Effective timer interval (configured value or the default).
-    pub fn effective_interval(&self) -> Duration {
-        self.interval.unwrap_or(DEFAULT_INTERVAL)
+    /// Effective timer interval: the per-sync value, else the daemon default.
+    pub fn effective_interval(&self, daemon_default: Duration) -> Duration {
+        self.interval.unwrap_or(daemon_default)
     }
 
-    /// Effective excludes: the configured list plus the forced conflict-copy glob.
-    pub fn effective_excludes(&self) -> Vec<String> {
-        let mut out = self.exclude.clone();
+    /// Effective excludes: the `[daemon]`-level `defaults`, this group's own
+    /// `exclude`, and the always-forced conflict-copy glob, unioned (deduped).
+    pub fn effective_excludes(&self, defaults: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for pat in defaults.iter().chain(&self.exclude) {
+            if !out.iter().any(|p| p == pat) {
+                out.push(pat.clone());
+            }
+        }
         if !out.iter().any(|p| p == CONFLICT_GLOB) {
             out.push(CONFLICT_GLOB.to_string());
         }
         out
     }
 
-    /// Whether `include` selects everything under `root`.
+    /// Whether `include` selects everything under `local`.
     pub fn includes_all(&self) -> bool {
         self.include.is_empty()
     }
@@ -237,8 +355,26 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_exclude() -> Vec<String> {
+    DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect()
+}
+
 fn default_debounce() -> Duration {
     DEFAULT_DEBOUNCE
+}
+
+fn default_interval() -> Duration {
+    DEFAULT_INTERVAL
+}
+
+/// Active profile when the `[daemon] profile` setting is omitted.
+fn default_profile() -> Option<String> {
+    Some("default".to_string())
+}
+
+/// Implicit profile membership when the `profiles` setting is omitted.
+fn default_profiles() -> Vec<String> {
+    vec!["default".to_string()]
 }
 
 /// Expand a leading `~` and `$VAR` references; falls back to the input on error.
@@ -299,15 +435,15 @@ mod tests {
         debounce = "5s"
 
         [[remote]]
-        name = "nc"
-        type = "webdav"
+        id = "nc"
+        backend = "webdav"
         url = "https://example.com/dav/"
         username = "me"
         password = "secret"
 
         [[sync]]
         remote = "nc"
-        root = "/tmp/cfg"
+        local = "/tmp/cfg"
         remote_path = "config"
         include = ["nvim", "fish/*"]
         trigger = "watch"
@@ -319,13 +455,33 @@ mod tests {
         let cfg = Config::from_toml_str(GOOD).expect("should parse");
         assert_eq!(cfg.daemon.debounce, Duration::from_secs(5));
         assert_eq!(cfg.remotes.len(), 1);
-        assert_eq!(cfg.remotes[0].kind, RemoteKind::Webdav);
+        assert_eq!(cfg.remotes[0].backend, RemoteKind::Webdav);
         let sync = &cfg.syncs[0];
         assert_eq!(sync.trigger, Trigger::Watch);
         assert_eq!(sync.debounce, Some(Duration::from_secs(3)));
-        assert_eq!(sync.pull_scope, PullScope::All);
+        assert_eq!(sync.pull_scope, None); // unset => inherits, resolving to `all`
         assert_eq!(sync.direction, Direction::Sync);
         assert!(!sync.includes_all());
+    }
+
+    #[test]
+    fn shipped_example_config_parses() {
+        // Guards against config.example.toml drifting from the schema. The
+        // example keeps only `[daemon]` uncommented (with every option at its
+        // default), so the remotes/syncs lists are empty.
+        let text = include_str!("../../../config.example.toml");
+        let cfg = Config::from_toml_str(text).expect("example config should parse");
+        assert!(cfg.remotes.is_empty());
+        assert!(cfg.syncs.is_empty());
+        // The `[daemon]` block spells out the built-in defaults verbatim.
+        let d = &cfg.daemon;
+        assert_eq!(d.log_level, default_log_level());
+        assert_eq!(d.debounce, DEFAULT_DEBOUNCE);
+        assert_eq!(d.interval, DEFAULT_INTERVAL);
+        assert_eq!(d.empty_dirs, EmptyDirMode::Ignore);
+        assert_eq!(d.profile.as_deref(), Some("default"));
+        // pull_interval is shown as "0s" (the representable "disabled" default).
+        assert!(d.pull_interval.is_none_or(|dur| dur.is_zero()));
     }
 
     #[test]
@@ -333,13 +489,13 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [[remote]]
-            name = "r"
-            type = "local"
+            id = "r"
+            backend = "local"
             url = "/tmp/mirror"
 
             [[sync]]
             remote = "r"
-            root = "/tmp/cfg"
+            local = "/tmp/cfg"
             remote_path = "x"
             trigger = "timer"
             direction = "pull"
@@ -354,23 +510,251 @@ mod tests {
         let cfg = Config::from_toml_str(
             r#"
             [[remote]]
-            name = "r"
-            type = "local"
+            id = "r"
+            backend = "local"
             url = "/tmp/mirror"
 
             [[sync]]
             remote = "r"
-            root = "/tmp/cfg"
+            local = "/tmp/cfg"
             remote_path = "x"
             trigger = "timer"
         "#,
         )
         .unwrap();
         assert_eq!(cfg.daemon.debounce, DEFAULT_DEBOUNCE);
+        assert_eq!(cfg.daemon.interval, DEFAULT_INTERVAL);
+        // `profile` defaults to "default" when the setting is omitted.
+        assert_eq!(cfg.daemon.profile.as_deref(), Some("default"));
+        // `[daemon] exclude` defaults to the well-known list.
+        assert_eq!(cfg.daemon.exclude, default_exclude());
+        assert!(cfg.daemon.exclude.iter().any(|e| e == "**/.git/**"));
         let sync = &cfg.syncs[0];
         assert!(sync.includes_all());
-        assert_eq!(sync.effective_interval(), DEFAULT_INTERVAL);
-        assert!(sync.effective_excludes().iter().any(|e| e == CONFLICT_GLOB));
+        // No per-sync interval => falls back to the daemon default.
+        assert_eq!(sync.interval, None);
+        assert_eq!(sync.effective_interval(cfg.daemon.interval), DEFAULT_INTERVAL);
+        // effective_excludes merges the daemon defaults, the sync's own, and the
+        // forced conflict glob.
+        let eff = sync.effective_excludes(&cfg.daemon.exclude);
+        assert!(eff.iter().any(|e| e == CONFLICT_GLOB));
+        assert!(eff.iter().any(|e| e == "**/.git/**"));
+    }
+
+    #[test]
+    fn exclude_merges_daemon_defaults_with_sync_and_can_be_overridden() {
+        // Sync-level excludes ADD to the daemon defaults; both plus the forced
+        // conflict glob show up.
+        let defaults = vec!["**/.git/**".to_string()];
+        let sync = Sync {
+            label: None,
+            remote: "r".into(),
+            local: "/tmp/x".into(),
+            remote_path: String::new(),
+            direction: Direction::Sync,
+            include: vec![],
+            pull_scope: None,
+            trigger: Trigger::Manual,
+            interval: None,
+            debounce: None,
+            pull_interval: None,
+            empty_dirs: None,
+            profiles: default_profiles(),
+            exclude: vec!["*.log".to_string()],
+        };
+        let eff = sync.effective_excludes(&defaults);
+        assert!(eff.iter().any(|e| e == "**/.git/**"));
+        assert!(eff.iter().any(|e| e == "*.log"));
+        assert!(eff.iter().any(|e| e == CONFLICT_GLOB));
+
+        // Empty daemon defaults (user opted out) => only the sync's own + forced.
+        let eff = sync.effective_excludes(&[]);
+        assert!(!eff.iter().any(|e| e == "**/.git/**"));
+        assert!(eff.iter().any(|e| e == CONFLICT_GLOB));
+    }
+
+    #[test]
+    fn remote_path_is_optional_and_maps_to_remote_root() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "mirror"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "mirror"
+            local = "/tmp/a"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "mirror"
+            local = "/tmp/b"
+            remote_path = "/sub/dir/"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap();
+        // Omitted => empty (remote root); label is just the remote name.
+        assert_eq!(cfg.syncs[0].remote_path, "");
+        assert_eq!(crate::engine::group_label(&cfg.syncs[0]), "mirror");
+        // Surrounding slashes are trimmed on load.
+        assert_eq!(cfg.syncs[1].remote_path, "sub/dir");
+        assert_eq!(crate::engine::group_label(&cfg.syncs[1]), "mirror:sub/dir");
+    }
+
+    #[test]
+    fn rejects_commit_msg_command_on_non_git_backend() {
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "m"
+            backend = "local"
+            url = "/tmp/mirror"
+            commit_msg_command = "printf hi"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_watch_both_on_non_local_backend() {
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "nc"
+            backend = "webdav"
+            url = "https://example.com/dav/"
+
+            [[sync]]
+            remote = "nc"
+            local = "/tmp/x"
+            trigger = "watch-both"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        // A local backend with watch-both is fine.
+        Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "m"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "m"
+            local = "/tmp/x"
+            trigger = "watch-both"
+        "#,
+        )
+        .expect("watch-both on a local backend should be valid");
+    }
+
+    #[test]
+    fn rejects_duplicate_group_labels() {
+        // Both default remote_path to the root => same label => index collision.
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "mirror"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "mirror"
+            local = "/tmp/a"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "mirror"
+            local = "/tmp/b"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn daemon_interval_overrides_default_and_syncs_inherit_it() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [daemon]
+            interval = "15m"
+
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/a"
+            remote_path = "a"
+            trigger = "timer"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/b"
+            remote_path = "b"
+            trigger = "timer"
+            interval = "5m"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.daemon.interval, Duration::from_secs(15 * 60));
+        // Sync without its own interval inherits the daemon-level value.
+        assert_eq!(
+            cfg.syncs[0].effective_interval(cfg.daemon.interval),
+            Duration::from_secs(15 * 60)
+        );
+        // Per-sync interval still wins.
+        assert_eq!(
+            cfg.syncs[1].effective_interval(cfg.daemon.interval),
+            Duration::from_secs(5 * 60)
+        );
+    }
+
+    #[test]
+    fn profiles_default_to_implicit_default_only_when_omitted() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/a"
+            remote_path = "a"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/b"
+            remote_path = "b"
+            trigger = "manual"
+            profiles = ["desktop"]
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/c"
+            remote_path = "c"
+            trigger = "manual"
+            profiles = []
+        "#,
+        )
+        .unwrap();
+        // Omitted => implicit ["default"].
+        assert_eq!(cfg.syncs[0].profiles, vec!["default".to_string()]);
+        // Explicit list => used verbatim, no implicit "default".
+        assert_eq!(cfg.syncs[1].profiles, vec!["desktop".to_string()]);
+        // Explicit empty => member of no profile.
+        assert!(cfg.syncs[2].profiles.is_empty());
     }
 
     #[test]
@@ -379,7 +763,7 @@ mod tests {
             r#"
             [[sync]]
             remote = "ghost"
-            root = "/tmp/cfg"
+            local = "/tmp/cfg"
             remote_path = "x"
             trigger = "manual"
         "#,
@@ -393,12 +777,12 @@ mod tests {
         let err = Config::from_toml_str(
             r#"
             [[remote]]
-            name = "dup"
-            type = "local"
+            id = "dup"
+            backend = "local"
             url = "/a"
             [[remote]]
-            name = "dup"
-            type = "local"
+            id = "dup"
+            backend = "local"
             url = "/b"
         "#,
         )

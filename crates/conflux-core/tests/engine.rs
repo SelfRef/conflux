@@ -3,6 +3,7 @@
 use conflux_core::backend;
 use conflux_core::engine::{self, SyncReport, Winner};
 use conflux_core::index::Index;
+use conflux_core::model::EmptyDirMode;
 use conflux_core::Config;
 use filetime::FileTime;
 use std::fs;
@@ -13,13 +14,13 @@ fn config(local: &Path, remote: &Path, extra: &str) -> Config {
     let toml = format!(
         r#"
         [[remote]]
-        name = "m"
-        type = "local"
+        id = "m"
+        backend = "local"
         url = "{remote}"
 
         [[sync]]
         remote = "m"
-        root = "{local}"
+        local = "{local}"
         remote_path = "data"
         trigger = "manual"
         {extra}
@@ -31,10 +32,24 @@ fn config(local: &Path, remote: &Path, extra: &str) -> Config {
 }
 
 fn run(cfg: &Config, index: &mut Index) -> SyncReport {
+    run_mode(cfg, index, EmptyDirMode::Ignore)
+}
+
+fn run_mode(cfg: &Config, index: &mut Index, empty_dirs: EmptyDirMode) -> SyncReport {
     let sync = &cfg.syncs[0];
     let remote = cfg.remote(&sync.remote).unwrap();
     let backend = backend::build(remote, sync, Path::new("/unused-for-local")).unwrap();
-    engine::sync_group(sync, backend.as_ref(), index).expect("sync should succeed")
+    let pull_scope = sync.pull_scope.or(remote.pull_scope).unwrap_or_default();
+    engine::sync_group(
+        sync,
+        backend.as_ref(),
+        index,
+        false,
+        empty_dirs,
+        pull_scope,
+        &cfg.daemon.exclude,
+    )
+    .expect("sync should succeed")
 }
 
 fn write(path: &Path, contents: &str) {
@@ -91,7 +106,7 @@ fn pushes_new_local_file_then_is_idempotent() {
 
     write(&d.local.join("a.txt"), "hello");
     let report = run(&cfg, &mut index);
-    assert_eq!(report.pushed.len(), 1);
+    assert_eq!(report.added.len(), 1);
     assert_eq!(read(&d.remote.join("data/a.txt")), "hello");
 
     // Second run: nothing to do.
@@ -110,7 +125,7 @@ fn pulls_new_remote_file() {
 
     write(&d.remote.join("data/b.txt"), "remote-side");
     let report = run(&cfg, &mut index);
-    assert_eq!(report.pulled.len(), 1);
+    assert_eq!(report.added.len(), 1);
     assert_eq!(read(&d.local.join("b.txt")), "remote-side");
 }
 
@@ -131,8 +146,7 @@ fn propagates_deletes_both_ways() {
     fs::remove_file(d.local.join("keep.txt")).unwrap();
     fs::remove_file(d.remote.join("data/fromremote.txt")).unwrap();
     let report = run(&cfg, &mut index);
-    assert_eq!(report.deleted_remote.len(), 1);
-    assert_eq!(report.deleted_local.len(), 1);
+    assert_eq!(report.removed.len(), 2); // one deleted on each side
     assert!(!d.remote.join("data/keep.txt").exists());
     assert!(!d.local.join("fromremote.txt").exists());
 }
@@ -176,13 +190,98 @@ fn pull_only_applies_remote_changes_but_never_pushes() {
     write(&d.remote.join("data/down.txt"), "incoming");
     let report = run(&cfg, &mut index);
 
-    assert!(report.pushed.is_empty(), "pull-only must not push");
-    assert_eq!(report.pulled.len(), 1);
+    assert_eq!(report.added.len(), 1, "the new remote file is pulled");
+    // (that nothing was pushed is asserted below via the remote filesystem)
     assert_eq!(read(&d.local.join("down.txt")), "incoming");
     assert!(
         !d.remote.join("data/local-only.txt").exists(),
         "local-only file must not reach the remote"
     );
+}
+
+#[test]
+fn local_backend_preserves_mtime_both_ways() {
+    let d = dirs();
+    let cfg = config(&d.local, &d.remote, "");
+    let mut index = Index::default();
+
+    // Push: the mirror copy must keep the source's modification time.
+    write(&d.local.join("f.txt"), "hi");
+    set_mtime(&d.local.join("f.txt"), 1_000_000);
+    run(&cfg, &mut index);
+    let got = FileTime::from_last_modification_time(
+        &fs::metadata(d.remote.join("data/f.txt")).unwrap(),
+    );
+    assert_eq!(got, FileTime::from_unix_time(1_000_000, 0), "push kept mtime");
+
+    // Pull: the local copy must keep the remote file's modification time.
+    write(&d.remote.join("data/g.txt"), "yo");
+    set_mtime(&d.remote.join("data/g.txt"), 2_000_000);
+    run(&cfg, &mut index);
+    let got =
+        FileTime::from_last_modification_time(&fs::metadata(d.local.join("g.txt")).unwrap());
+    assert_eq!(got, FileTime::from_unix_time(2_000_000, 0), "pull kept mtime");
+}
+
+#[test]
+fn mirror_syncs_empty_dirs_both_ways_and_ignore_does_not() {
+    let d = dirs();
+    let mut index = Index::default();
+
+    // An empty dir on each side.
+    fs::create_dir_all(d.local.join("emptylocal")).unwrap();
+    fs::create_dir_all(d.remote.join("data/emptyremote")).unwrap();
+
+    // Default (ignore): empty dirs are neither created nor removed.
+    let cfg = config(&d.local, &d.remote, "");
+    let report = run(&cfg, &mut index);
+    assert!(report.added.is_empty());
+    assert!(!d.remote.join("data/emptylocal").exists());
+    assert!(!d.local.join("emptyremote").exists());
+
+    // mirror: each empty dir is mirrored to the other side.
+    let mut index = Index::default();
+    let report = run_mode(&cfg, &mut index, EmptyDirMode::Mirror);
+    assert_eq!(report.added.len(), 2);
+    assert!(d.remote.join("data/emptylocal").is_dir());
+    assert!(d.local.join("emptyremote").is_dir());
+}
+
+#[test]
+fn mirror_propagates_empty_dir_deletion() {
+    let d = dirs();
+    let cfg = config(&d.local, &d.remote, "");
+    let mut index = Index::default();
+
+    fs::create_dir_all(d.local.join("shared")).unwrap();
+    run_mode(&cfg, &mut index, EmptyDirMode::Mirror);
+    assert!(d.remote.join("data/shared").is_dir());
+
+    // Remove it locally; mirror mode should delete it on the remote too.
+    fs::remove_dir(d.local.join("shared")).unwrap();
+    let report = run_mode(&cfg, &mut index, EmptyDirMode::Mirror);
+    assert_eq!(report.removed.len(), 1);
+    assert!(!d.remote.join("data/shared").exists());
+}
+
+#[test]
+fn prune_removes_empty_dirs_including_nested_parents() {
+    let d = dirs();
+    let cfg = config(&d.local, &d.remote, "");
+    let mut index = Index::default();
+
+    // A file whose deletion leaves an empty nested dir tree behind.
+    write(&d.local.join("a/b/c.txt"), "x");
+    run(&cfg, &mut index);
+    assert!(d.remote.join("data/a/b/c.txt").exists());
+
+    fs::remove_file(d.local.join("a/b/c.txt")).unwrap();
+    let report = run_mode(&cfg, &mut index, EmptyDirMode::Prune);
+    // The file delete propagates, and the now-empty a/ and a/b/ are pruned both sides.
+    // the file delete plus the now-empty a/ and a/b/ all count as removed
+    assert!(report.removed.len() >= 3);
+    assert!(!d.local.join("a").exists(), "local empty parents pruned");
+    assert!(!d.remote.join("data/a").exists(), "remote empty parents pruned");
 }
 
 #[test]
@@ -195,7 +294,7 @@ fn include_restricts_what_is_pushed() {
     write(&d.local.join("other/b.txt"), "no");
     let report = run(&cfg, &mut index);
 
-    assert_eq!(report.pushed.len(), 1);
+    assert_eq!(report.added.len(), 1);
     assert!(d.remote.join("data/keep/a.txt").exists());
     assert!(
         !d.remote.join("data/other/b.txt").exists(),
