@@ -72,7 +72,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cross build --locked --release --bin conflux --target ${{ matrix.target }}
+        run: cross build --locked --release --bin conflux --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Assemble package
         id: package

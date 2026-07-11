@@ -28,6 +28,13 @@ git2 = { workspace = true }
 libc = "0.2"
 shellexpand = "3"
 
+[features]
+# Build OpenSSL from source and link it statically, instead of requiring the
+# system library. Used for the portable, cross-compiled release binaries (the
+# `cross` build containers have no target OpenSSL); normal source builds link
+# the system OpenSSL as before.
+vendored-openssl = ["git2/vendored-openssl"]
+
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"

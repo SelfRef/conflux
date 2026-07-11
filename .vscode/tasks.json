@@ -21,6 +21,20 @@
 			"problemMatcher": ["$rustc"],
 			"group": "none",
 			"detail": "cargo run -- daemon (foreground; Ctrl+C to stop)"
+		},
+		{
+			"label": "release: push master → release",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"push",
+				"--force",
+				"origin",
+				"master:release"
+			],
+			"problemMatcher": [],
+			"group": "none",
+			"detail": "Force-update the remote 'release' branch to the current master commit (no checkout). Triggers the Release workflow."
 		}
 	]
 }

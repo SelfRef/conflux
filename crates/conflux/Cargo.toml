@@ -12,6 +12,11 @@ description = "Background file-sync service: daemon mode plus CLI control."
 name = "conflux"
 path = "src/main.rs"
 
+[features]
+# Statically link a vendored OpenSSL (see conflux-core). Enabled for release
+# binaries built in the cross-compilation containers.
+vendored-openssl = ["conflux-core/vendored-openssl"]
+
 [dependencies]
 conflux-core = { workspace = true }
 clap = { workspace = true }
