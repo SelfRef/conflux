@@ -2,7 +2,7 @@
 
 _pkgbase=conflux
 pkgname="$_pkgbase-git"
-pkgver=1.0.0
+pkgver=1.0.0.r0.g2c7bd74
 pkgrel=1
 pkgdesc='Background file-sync daemon syncing local directories to multiple remotes'
 arch=('x86_64' 'aarch64')
@@ -12,6 +12,7 @@ depends=('gcc-libs' 'glibc' 'openssl' 'zlib')
 makedepends=('cargo' 'git')
 provides=("$_pkgbase")
 conflicts=("$_pkgbase")
+options=('!lto')
 backup=('etc/conflux/config.toml')
 source=("$_pkgbase::git+https://github.com/SelfRef/conflux.git")
 sha256sums=('SKIP')
