@@ -93,7 +93,7 @@ pub(crate) fn walk_empty_dirs(base: &Path) -> Result<BTreeSet<RelPath>> {
 pub fn build(remote: &Remote, sync: &Sync, state_dir: &Path) -> Result<Box<dyn Backend>> {
     use crate::model::RemoteKind;
     match remote.backend {
-        RemoteKind::Local => Ok(Box::new(local::LocalBackend::new(remote, sync))),
+        RemoteKind::Filesystem => Ok(Box::new(local::LocalBackend::new(remote, sync))),
         RemoteKind::Webdav => Ok(Box::new(webdav::WebdavBackend::new(remote, sync)?)),
         RemoteKind::Git => Ok(Box::new(git::GitBackend::new(remote, sync, state_dir)?)),
     }

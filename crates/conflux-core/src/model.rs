@@ -33,17 +33,18 @@ pub enum RemoteKind {
     Webdav,
     /// A git repository.
     Git,
-    /// A local directory (mirror / test backend).
-    Local,
+    /// A local directory (mirror / test backend). Also synthesized implicitly
+    /// for a sync group's `remote_fs` shortcut.
+    Filesystem,
 }
 
 impl RemoteKind {
-    /// The lowercase name used in config (`"webdav"`, `"git"`, `"local"`).
+    /// The lowercase name used in config (`"webdav"`, `"git"`, `"filesystem"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             RemoteKind::Webdav => "webdav",
             RemoteKind::Git => "git",
-            RemoteKind::Local => "local",
+            RemoteKind::Filesystem => "filesystem",
         }
     }
 }
@@ -58,9 +59,10 @@ pub enum Trigger {
     Timer,
     /// Synced when watched local files change.
     Watch,
-    /// Like `watch`, but also watches the remote side. Only a `local` backend
-    /// exposes a watchable filesystem path, so for other backends this behaves
-    /// like `watch` (local-only) and logs a warning.
+    /// Like `watch`, but also watches the remote side. Only a `filesystem`
+    /// backend (including a `remote_fs` shortcut) exposes a watchable filesystem
+    /// path, so for other backends this behaves like `watch` (local-only) and
+    /// logs a warning.
     #[serde(rename = "watch-both")]
     WatchBoth,
 }

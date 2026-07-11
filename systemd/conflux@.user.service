@@ -14,8 +14,9 @@
 # subdirectory and control socket (conflux-<profile>.sock). Target one with,
 # e.g., `conflux --profile desktop status`.
 #
-# The `conflux` binary must be on the unit's PATH (e.g. ~/.cargo/bin, ~/.local/bin,
-# or /usr/local/bin). Use an absolute ExecStart path if it is not.
+# ExecStart uses the packaged path /usr/bin/conflux. install.sh rewrites it to
+# the actual binary location for from-source installs (e.g. ~/.local/bin); edit
+# it by hand if the binary lives elsewhere.
 
 [Unit]
 Description=conflux file-sync daemon (user, profile %i)
@@ -25,7 +26,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=CONFLUX_LOG=info
-ExecStart=conflux --profile %i daemon
+ExecStart=/usr/bin/conflux --profile %i daemon
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5

@@ -112,10 +112,11 @@ impl From<&SyncReport> for SyncSummary {
 /// A stable, human-readable label for a sync group (`remote:remote_path`, or
 /// just `remote` when the group maps to the remote's root).
 pub fn group_label(sync: &Sync) -> String {
+    let remote = sync.remote_id();
     if sync.remote_path.is_empty() {
-        sync.remote.clone()
+        remote.to_string()
     } else {
-        format!("{}:{}", sync.remote, sync.remote_path)
+        format!("{remote}:{}", sync.remote_path)
     }
 }
 

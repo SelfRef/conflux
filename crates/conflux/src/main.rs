@@ -118,7 +118,8 @@ fn run(cli: &Cli, log_reload: &LogReload) -> anyhow::Result<ExitCode> {
             let mut config = Config::load(&paths.config)?;
             // Apply the configured log level, unless CONFLUX_LOG is set (env wins).
             if std::env::var_os("CONFLUX_LOG").is_none() {
-                if let Ok(filter) = EnvFilter::try_new(daemon_log_directive(&config.daemon.log_level))
+                if let Ok(filter) =
+                    EnvFilter::try_new(daemon_log_directive(&config.daemon.log_level))
                 {
                     let _ = log_reload.modify(|f| *f = filter);
                 }

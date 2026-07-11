@@ -1,10 +1,9 @@
-//! End-to-end engine tests using the local backend and real temp directories.
+//! End-to-end engine tests using the filesystem backend and real temp directories.
 
 use conflux_core::backend;
 use conflux_core::engine::{self, SyncReport, Winner};
 use conflux_core::index::Index;
 use conflux_core::model::EmptyDirMode;
-use conflux_core::model::Deletions;
 use conflux_core::Config;
 use filetime::FileTime;
 use std::fs;
@@ -33,7 +32,7 @@ fn config(local: &Path, remote: &Path, extra: &str) -> Config {
         r#"
         [[remote]]
         id = "m"
-        backend = "local"
+        backend = "filesystem"
         url = "{remote}"
 
         [[sync]]
@@ -57,7 +56,7 @@ fn run(cfg: &Config, index: &mut Index) -> SyncReport {
 
 fn run_mode(cfg: &Config, index: &mut Index, empty_dirs: EmptyDirMode) -> SyncReport {
     let sync = &cfg.syncs[0];
-    let remote = cfg.remote(&sync.remote).unwrap();
+    let remote = cfg.remote(sync.remote_id()).unwrap();
     let backend = backend::build(remote, sync, Path::new("/unused-for-local")).unwrap();
     // Resolve max_file_size the way the daemon does: sync → remote → daemon.
     let max_file_size = sync
@@ -241,18 +240,24 @@ fn local_backend_preserves_mtime_both_ways() {
     write(&d.local.join("f.txt"), "hi");
     set_mtime(&d.local.join("f.txt"), 1_000_000);
     run(&cfg, &mut index);
-    let got = FileTime::from_last_modification_time(
-        &fs::metadata(d.remote.join("data/f.txt")).unwrap(),
+    let got =
+        FileTime::from_last_modification_time(&fs::metadata(d.remote.join("data/f.txt")).unwrap());
+    assert_eq!(
+        got,
+        FileTime::from_unix_time(1_000_000, 0),
+        "push kept mtime"
     );
-    assert_eq!(got, FileTime::from_unix_time(1_000_000, 0), "push kept mtime");
 
     // Pull: the local copy must keep the remote file's modification time.
     write(&d.remote.join("data/g.txt"), "yo");
     set_mtime(&d.remote.join("data/g.txt"), 2_000_000);
     run(&cfg, &mut index);
-    let got =
-        FileTime::from_last_modification_time(&fs::metadata(d.local.join("g.txt")).unwrap());
-    assert_eq!(got, FileTime::from_unix_time(2_000_000, 0), "pull kept mtime");
+    let got = FileTime::from_last_modification_time(&fs::metadata(d.local.join("g.txt")).unwrap());
+    assert_eq!(
+        got,
+        FileTime::from_unix_time(2_000_000, 0),
+        "pull kept mtime"
+    );
 }
 
 #[test]
@@ -313,7 +318,10 @@ fn prune_removes_empty_dirs_including_nested_parents() {
     // the file delete plus the now-empty a/ and a/b/ all count as removed
     assert!(report.removed.len() >= 3);
     assert!(!d.local.join("a").exists(), "local empty parents pruned");
-    assert!(!d.remote.join("data/a").exists(), "remote empty parents pruned");
+    assert!(
+        !d.remote.join("data/a").exists(),
+        "remote empty parents pruned"
+    );
 }
 
 #[test]
@@ -348,7 +356,10 @@ fn scope_include_ignores_paths_outside_include_in_both_directions() {
 
     assert!(report.is_empty(), "nothing is included, so nothing syncs");
     assert!(d.local.join("mine.txt").exists(), "local file untouched");
-    assert!(!d.local.join("theirs.txt").exists(), "remote file not pulled");
+    assert!(
+        !d.local.join("theirs.txt").exists(),
+        "remote file not pulled"
+    );
     assert!(
         !d.remote.join("data/mine.txt").exists(),
         "local file not pushed"
@@ -377,7 +388,10 @@ fn scope_include_with_glob_syncs_only_matched_paths_both_ways() {
     fs::remove_file(d.local.join("keep/a.txt")).unwrap();
     fs::remove_file(d.remote.join("data/other/y.txt")).unwrap();
     run(&cfg, &mut index);
-    assert!(!d.remote.join("data/keep/a.txt").exists(), "included delete propagates");
+    assert!(
+        !d.remote.join("data/keep/a.txt").exists(),
+        "included delete propagates"
+    );
 }
 
 #[test]
@@ -404,7 +418,11 @@ fn scope_remote_pulls_non_included_files_read_only() {
     write(&d.local.join("dotfile"), "local-edit");
     write(&d.remote.join("data/dotfile"), "remote-edit");
     let report = run(&cfg, &mut index);
-    assert_eq!(read(&d.local.join("dotfile")), "remote-edit", "remote overrides local");
+    assert_eq!(
+        read(&d.local.join("dotfile")),
+        "remote-edit",
+        "remote overrides local"
+    );
     assert_eq!(report.conflicts.len(), 1);
     let copy = find_conflict_copy(&d.local).expect("conflict copy should exist");
     assert_eq!(read(&copy), "local-edit");
@@ -434,7 +452,11 @@ fn scope_local_pushes_non_included_files_and_local_overrides_remote() {
     write(&d.local.join("note.txt"), "local-edit");
     write(&d.remote.join("data/note.txt"), "remote-edit");
     let report = run(&cfg, &mut index);
-    assert_eq!(read(&d.remote.join("data/note.txt")), "local-edit", "local overrides remote");
+    assert_eq!(
+        read(&d.remote.join("data/note.txt")),
+        "local-edit",
+        "local overrides remote"
+    );
     assert_eq!(report.conflicts.len(), 1);
     let copy = find_conflict_copy(&d.local).expect("conflict copy should exist");
     assert_eq!(read(&copy), "remote-edit");
@@ -444,14 +466,22 @@ fn scope_local_pushes_non_included_files_and_local_overrides_remote() {
 fn scope_mirror_syncs_everything_ignoring_include() {
     // `include` is set but ignored under `scope = "mirror"`: everything syncs.
     let d = dirs();
-    let cfg = config(&d.local, &d.remote, "scope = \"mirror\"\ninclude = [\"keep\"]");
+    let cfg = config(
+        &d.local,
+        &d.remote,
+        "scope = \"mirror\"\ninclude = [\"keep\"]",
+    );
     let mut index = Index::default();
 
     write(&d.local.join("keep/a.txt"), "yes");
     write(&d.local.join("other/b.txt"), "also");
     let report = run(&cfg, &mut index);
 
-    assert_eq!(report.added.len(), 2, "mirror ignores include and syncs all");
+    assert_eq!(
+        report.added.len(),
+        2,
+        "mirror ignores include and syncs all"
+    );
     assert!(d.remote.join("data/keep/a.txt").exists());
     assert!(d.remote.join("data/other/b.txt").exists());
 }
@@ -464,14 +494,26 @@ fn max_file_size_skips_oversize_files_in_both_directions() {
     let mut index = Index::default();
 
     write(&d.local.join("small.txt"), "hi"); // 2 bytes: pushed
-    write(&d.local.join("big.txt"), "this is definitely over ten bytes"); // skipped
+    write(
+        &d.local.join("big.txt"),
+        "this is definitely over ten bytes",
+    ); // skipped
     write(&d.remote.join("data/incoming-small.txt"), "ok"); // pulled
-    write(&d.remote.join("data/incoming-big.txt"), "also way over the ten byte cap"); // skipped
+    write(
+        &d.remote.join("data/incoming-big.txt"),
+        "also way over the ten byte cap",
+    ); // skipped
     let report = run(&cfg, &mut index);
 
     assert_eq!(report.added.len(), 2, "only the two small files sync");
-    assert!(d.remote.join("data/small.txt").exists(), "small local file pushed");
-    assert!(d.local.join("incoming-small.txt").exists(), "small remote file pulled");
+    assert!(
+        d.remote.join("data/small.txt").exists(),
+        "small local file pushed"
+    );
+    assert!(
+        d.local.join("incoming-small.txt").exists(),
+        "small remote file pulled"
+    );
     assert!(
         !d.remote.join("data/big.txt").exists(),
         "oversize local file must not be pushed"
@@ -492,5 +534,8 @@ fn max_file_size_zero_means_unlimited() {
     let report = run(&cfg, &mut index);
 
     assert_eq!(report.added.len(), 1);
-    assert!(d.remote.join("data/big.txt").exists(), "0 = unlimited, so it syncs");
+    assert!(
+        d.remote.join("data/big.txt").exists(),
+        "0 = unlimited, so it syncs"
+    );
 }

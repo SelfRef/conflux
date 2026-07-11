@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    branches: [release]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='conflux'))")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Detected version: v$version"
+
+      - name: Check tag does not already exist
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists. Bump the version in Cargo.toml, or delete the existing release AND tag to recreate it."
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cross build --locked --release --bin conflux --target ${{ matrix.target }}
+
+      - name: Assemble package
+        id: package
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          pkgname="conflux-${TAG}-${ARCH}-linux"
+          root="dist/${pkgname}"
+
+          install -Dm0755 "target/${TARGET}/release/conflux"  "$root/usr/bin/conflux"
+          install -Dm0644 config.example.toml                 "$root/etc/conflux/config.toml"
+          install -Dm0644 systemd/conflux.user.service        "$root/usr/lib/systemd/user/conflux.service"
+          install -Dm0644 systemd/conflux@.user.service       "$root/usr/lib/systemd/user/conflux@.service"
+          install -Dm0644 systemd/conflux.system.service      "$root/usr/lib/systemd/system/conflux.service"
+          install -Dm0644 systemd/conflux@.system.service     "$root/usr/lib/systemd/system/conflux@.service"
+          install -Dm0644 LICENSE                              "$root/usr/share/licenses/conflux/LICENSE"
+
+          tarball="${pkgname}.tar.gz"
+          tar -czf "$tarball" -C dist "$pkgname"
+          sha256sum "$tarball" > "${tarball}.sha256"
+
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: conflux-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.tarball }}.sha256
+          retention-days: 1
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract changelog section
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          # Pull the `## [VERSION] - ...` section out of CHANGELOG.md (stops at
+          # the next version heading or the link-reference block). Empty when the
+          # version has no entry — the release still gets auto-generated notes.
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") { flag = 1; next }
+            flag && (/^## \[/ || /^\[.*\]:/) { flag = 0 }
+            flag { print }
+          ' CHANGELOG.md > release_notes.md
+          if [ -s release_notes.md ]; then
+            echo "Release notes from CHANGELOG.md:"; cat release_notes.md
+          else
+            echo "::warning::No CHANGELOG.md section for $VERSION; using generated notes only."
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: release_notes.md
+          generate_release_notes: true
+          files: artifacts/*

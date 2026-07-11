@@ -330,7 +330,9 @@ impl Backend for WebdavBackend {
         if status.is_success() || status == StatusCode::NOT_FOUND {
             Ok(())
         } else {
-            Err(Error::Backend(format!("DELETE dir {path} failed: {status}")))
+            Err(Error::Backend(format!(
+                "DELETE dir {path} failed: {status}"
+            )))
         }
     }
 }

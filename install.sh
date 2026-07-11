@@ -158,13 +158,14 @@ do_install() {
 }
 
 # install_unit <src-basename> <dest-path>
-# Copies a unit file, rewriting its ExecStart to the binary we just installed so
-# it works regardless of the systemd manager's PATH.
+# Copies a unit file, rewriting its ExecStart from the packaged /usr/bin/conflux
+# to the binary we just installed (~/.local/bin or /usr/local/bin) so this
+# from-source install works wherever the binary landed.
 install_unit() {
     local src="$SCRIPT_DIR/systemd/$1" dest="$2"
     [ -f "$src" ] || die "unit file missing: $src"
     install -d "$(dirname "$dest")"
-    sed -E "s#^ExecStart=(/usr/local/bin/)?conflux#ExecStart=${BIN}#" "$src" >"$dest"
+    sed -E "s#^ExecStart=(/[^ ]*/)?conflux#ExecStart=${BIN}#" "$src" >"$dest"
     chmod 644 "$dest"
 }
 

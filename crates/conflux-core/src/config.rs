@@ -128,7 +128,7 @@ pub struct Remote {
     pub label: Option<String>,
     /// Backend kind.
     pub backend: RemoteKind,
-    /// Backend URL (WebDAV base / git remote / local path).
+    /// Backend URL (WebDAV base / git remote / filesystem path).
     pub url: String,
     /// Optional username for auth.
     #[serde(default)]
@@ -170,7 +170,17 @@ pub struct Sync {
     #[serde(default)]
     pub label: Option<String>,
     /// Id of the remote this group syncs with (matches a `[[remote]]` `id`).
-    pub remote: String,
+    /// Exactly one of `remote` or `remote_fs` must be set. After loading it is
+    /// always populated: a `remote_fs` group has a `filesystem` remote
+    /// synthesized for it (see [`Config::materialize_inline_remotes`]).
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Shortcut for syncing against a local filesystem path without declaring a
+    /// `[[remote]]`: give a directory here instead of `remote` and conflux
+    /// synthesizes a `filesystem` remote pointing at it. Tilde/env expanded on
+    /// load. Mutually exclusive with `remote`.
+    #[serde(default)]
+    pub remote_fs: Option<PathBuf>,
     /// Single local root directory (tilde/env expanded on load).
     pub local: PathBuf,
     /// Path under the remote that mirrors `local`. Optional; when omitted (or
@@ -235,6 +245,7 @@ impl Config {
         })?;
         let mut config: Config = toml::from_str(&text)?;
         config.normalize();
+        config.materialize_inline_remotes()?;
         config.validate()?;
         Ok(config)
     }
@@ -243,6 +254,7 @@ impl Config {
     pub fn from_toml_str(text: &str) -> Result<Self> {
         let mut config: Config = toml::from_str(text)?;
         config.normalize();
+        config.materialize_inline_remotes()?;
         config.validate()?;
         Ok(config)
     }
@@ -250,9 +262,9 @@ impl Config {
     /// Expand `~`/env vars in local roots and trim slashes off remote paths.
     fn normalize(&mut self) {
         for remote in &mut self.remotes {
-            // A `local` backend's url is a filesystem path, so expand `~`/$VARS
-            // in it just like a sync root. Other backends use it as a URL.
-            if remote.backend == RemoteKind::Local {
+            // A `filesystem` backend's url is a filesystem path, so expand
+            // `~`/$VARS in it just like a sync root. Others use it as a URL.
+            if remote.backend == RemoteKind::Filesystem {
                 remote.url = expand_path(Path::new(&remote.url))
                     .to_string_lossy()
                     .into_owned();
@@ -260,12 +272,55 @@ impl Config {
         }
         for sync in &mut self.syncs {
             sync.local = expand_path(&sync.local);
+            // A `remote_fs` shortcut is a filesystem path too; expand it before
+            // it becomes a synthesized remote's url.
+            if let Some(path) = &sync.remote_fs {
+                sync.remote_fs = Some(expand_path(path));
+            }
             // An empty / all-slashes `remote_path` means "the remote root".
             let trimmed = sync.remote_path.trim_matches('/');
             if trimmed.len() != sync.remote_path.len() {
                 sync.remote_path = trimmed.to_string();
             }
         }
+    }
+
+    /// Turn each sync's `remote_fs` shortcut into a real `filesystem`
+    /// `[[remote]]`, so the rest of the daemon sees a uniform remote list.
+    ///
+    /// For every group that sets `remote_fs`, a `filesystem` remote whose `url`
+    /// is that path is synthesized (deduplicated by path, so several groups can
+    /// share one), the group's `remote` is pointed at it, and `remote_fs` is
+    /// cleared. Enforces that exactly one of `remote`/`remote_fs` is set.
+    fn materialize_inline_remotes(&mut self) -> Result<()> {
+        for sync in &mut self.syncs {
+            match (&sync.remote, sync.remote_fs.take()) {
+                (Some(_), None) => {}
+                (None, Some(path)) => {
+                    let url = path.to_string_lossy().into_owned();
+                    // A stable, readable id derived from the path; reused when
+                    // several groups point `remote_fs` at the same directory.
+                    let id = format!("fs:{url}");
+                    if !self.remotes.iter().any(|r| r.id == id) {
+                        self.remotes.push(Remote::filesystem(id.clone(), url));
+                    }
+                    sync.remote = Some(id);
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::Validation(format!(
+                        "sync for `{}` sets both `remote` and `remote_fs`; use exactly one",
+                        sync.local.display()
+                    )));
+                }
+                (None, None) => {
+                    return Err(Error::Validation(format!(
+                        "sync for `{}` sets neither `remote` nor `remote_fs`; set one",
+                        sync.local.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check cross-field invariants. Returns the first problem found.
@@ -291,11 +346,11 @@ impl Config {
         let mut labels = HashSet::new();
         let mut sync_ids = HashSet::new();
         for sync in &self.syncs {
-            if !ids.contains(sync.remote.as_str()) {
+            if !ids.contains(sync.remote_id()) {
                 return Err(Error::Validation(format!(
                     "sync for `{}` references unknown remote `{}`",
                     sync.local.display(),
-                    sync.remote
+                    sync.remote_id()
                 )));
             }
             // Two groups sharing a (remote, remote_path) collide on their state
@@ -314,16 +369,16 @@ impl Config {
                 }
             }
             // `watch-both` watches the remote's filesystem path, which only a
-            // `local` backend has — reject it up front rather than silently
+            // `filesystem` backend has — reject it up front rather than silently
             // degrading to a local-only watch.
             if sync.trigger == Trigger::WatchBoth {
-                if let Some(remote) = self.remote(&sync.remote) {
-                    if remote.backend != RemoteKind::Local {
+                if let Some(remote) = self.remote(sync.remote_id()) {
+                    if remote.backend != RemoteKind::Filesystem {
                         return Err(Error::Validation(format!(
                             "sync `{label}` uses `trigger = \"watch-both\"`, which requires a \
-                             `local` backend, but remote `{}` is `{}`; use `trigger = \"watch\"` \
-                             (optionally with `pull_interval`) instead",
-                            sync.remote,
+                             `filesystem` backend, but remote `{}` is `{}`; use \
+                             `trigger = \"watch\"` (optionally with `pull_interval`) instead",
+                            sync.remote_id(),
                             remote.backend.as_str(),
                         )));
                     }
@@ -365,6 +420,24 @@ impl Config {
 }
 
 impl Remote {
+    /// A `filesystem` remote pointing at `url`, with every other field at its
+    /// default. Used to materialize a sync's `remote_fs` shortcut.
+    fn filesystem(id: String, url: String) -> Self {
+        Remote {
+            id,
+            label: None,
+            backend: RemoteKind::Filesystem,
+            url,
+            username: None,
+            password: None,
+            password_command: None,
+            branch: None,
+            commit_msg_command: None,
+            pull_interval: None,
+            max_file_size: None,
+        }
+    }
+
     /// Resolve the password: run `password_command` if set, else use `password`.
     pub fn resolve_password(&self) -> Result<Option<String>> {
         if let Some(cmd) = &self.password_command {
@@ -391,6 +464,13 @@ impl Remote {
 }
 
 impl Sync {
+    /// The resolved remote id. Always populated after [`Config::load`] /
+    /// [`Config::from_toml_str`], which synthesize a remote for `remote_fs`
+    /// groups; the fallback empty string is unreachable for a loaded config.
+    pub fn remote_id(&self) -> &str {
+        self.remote.as_deref().unwrap_or_default()
+    }
+
     /// Effective timer interval: the per-sync value, else the daemon default.
     pub fn effective_interval(&self, daemon_default: Duration) -> Duration {
         self.interval.unwrap_or(daemon_default)
@@ -467,7 +547,12 @@ fn parse_byte_size(s: &str) -> std::result::Result<u64, String> {
 /// preferring the largest unit that divides it evenly (e.g. `100000000` →
 /// `"100MB"`); falls back to a bare byte count (which also covers `0`).
 fn format_byte_size(n: u64) -> String {
-    const UNITS: &[(&str, u64)] = &[("TB", 1_000_000_000_000), ("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)];
+    const UNITS: &[(&str, u64)] = &[
+        ("TB", 1_000_000_000_000),
+        ("GB", 1_000_000_000),
+        ("MB", 1_000_000),
+        ("KB", 1_000),
+    ];
     for (name, factor) in UNITS {
         if n >= *factor && n % factor == 0 {
             return format!("{}{name}", n / factor);
@@ -653,7 +738,7 @@ mod tests {
 
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
             max_file_size = 0
 
@@ -677,7 +762,7 @@ mod tests {
             r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -699,7 +784,7 @@ mod tests {
             r#"
             [[remote]]
             id = "backup"
-            backend = "local"
+            backend = "filesystem"
             url = "~/remote-dir"
 
             [[sync]]
@@ -733,7 +818,7 @@ mod tests {
         let base = r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -760,7 +845,7 @@ mod tests {
         let base = r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -791,7 +876,7 @@ mod tests {
             r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -824,7 +909,10 @@ mod tests {
         );
         // No per-sync interval => falls back to the daemon default.
         assert_eq!(sync.interval, None);
-        assert_eq!(sync.effective_interval(cfg.daemon.interval), DEFAULT_INTERVAL);
+        assert_eq!(
+            sync.effective_interval(cfg.daemon.interval),
+            DEFAULT_INTERVAL
+        );
         // effective_excludes merges the daemon defaults, the sync's own, and the
         // forced conflict glob.
         let eff = sync.effective_excludes(&cfg.daemon.exclude);
@@ -840,7 +928,8 @@ mod tests {
         let sync = Sync {
             id: None,
             label: None,
-            remote: "r".into(),
+            remote: Some("r".into()),
+            remote_fs: None,
             local: "/tmp/x".into(),
             remote_path: String::new(),
             include: vec![],
@@ -872,7 +961,7 @@ mod tests {
             r#"
             [[remote]]
             id = "mirror"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -902,7 +991,7 @@ mod tests {
             r#"
             [[remote]]
             id = "m"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
             commit_msg_command = "printf hi"
         "#,
@@ -929,12 +1018,12 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
 
-        // A local backend with watch-both is fine.
+        // A filesystem backend with watch-both is fine.
         Config::from_toml_str(
             r#"
             [[remote]]
             id = "m"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -943,7 +1032,7 @@ mod tests {
             trigger = "watch-both"
         "#,
         )
-        .expect("watch-both on a local backend should be valid");
+        .expect("watch-both on a filesystem backend should be valid");
     }
 
     #[test]
@@ -953,7 +1042,7 @@ mod tests {
             r#"
             [[remote]]
             id = "mirror"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -980,7 +1069,7 @@ mod tests {
 
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -1017,7 +1106,7 @@ mod tests {
             r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/mirror"
 
             [[sync]]
@@ -1051,6 +1140,96 @@ mod tests {
     }
 
     #[test]
+    fn remote_fs_synthesizes_a_filesystem_remote() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let cfg = Config::from_toml_str(
+            r#"
+            [[sync]]
+            remote_fs = "~/backup"
+            local = "/tmp/a"
+            remote_path = "docs"
+            trigger = "watch-both"
+        "#,
+        )
+        .unwrap();
+        // A `filesystem` remote is materialized, its url the expanded path.
+        assert_eq!(cfg.remotes.len(), 1);
+        assert_eq!(cfg.remotes[0].backend, RemoteKind::Filesystem);
+        assert_eq!(cfg.remotes[0].url, format!("{home}/backup"));
+        // The sync now points at the synthesized remote; `remote_fs` is cleared.
+        let sync = &cfg.syncs[0];
+        assert_eq!(sync.remote_id(), format!("fs:{home}/backup"));
+        assert!(sync.remote_fs.is_none());
+        // watch-both is allowed because the synthesized backend is filesystem.
+        assert_eq!(sync.trigger, Trigger::WatchBoth);
+    }
+
+    #[test]
+    fn remote_fs_groups_sharing_a_path_reuse_one_remote() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [[sync]]
+            remote_fs = "/tmp/backup"
+            local = "/tmp/a"
+            remote_path = "a"
+            trigger = "manual"
+
+            [[sync]]
+            remote_fs = "/tmp/backup"
+            local = "/tmp/b"
+            remote_path = "b"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap();
+        // Both groups point `remote_fs` at the same dir => a single synthesized
+        // remote, shared, with distinct group labels by remote_path.
+        assert_eq!(cfg.remotes.len(), 1);
+        assert_eq!(cfg.syncs[0].remote_id(), cfg.syncs[1].remote_id());
+        assert_eq!(
+            crate::engine::group_label(&cfg.syncs[0]),
+            "fs:/tmp/backup:a"
+        );
+        assert_eq!(
+            crate::engine::group_label(&cfg.syncs[1]),
+            "fs:/tmp/backup:b"
+        );
+    }
+
+    #[test]
+    fn rejects_both_remote_and_remote_fs() {
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "r"
+            backend = "filesystem"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "r"
+            remote_fs = "/tmp/backup"
+            local = "/tmp/a"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_neither_remote_nor_remote_fs() {
+        let err = Config::from_toml_str(
+            r#"
+            [[sync]]
+            local = "/tmp/a"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
     fn rejects_unknown_remote() {
         let err = Config::from_toml_str(
             r#"
@@ -1071,11 +1250,11 @@ mod tests {
             r#"
             [[remote]]
             id = "dup"
-            backend = "local"
+            backend = "filesystem"
             url = "/a"
             [[remote]]
             id = "dup"
-            backend = "local"
+            backend = "filesystem"
             url = "/b"
         "#,
         )

@@ -11,8 +11,9 @@
 #
 # Every option below is commented out and shown at its default value, so this
 # file documents the defaults without changing them — uncomment only what you
-# want to override. You need at least one [[remote]] and one [[sync]] for the
-# daemon to do anything; ready-to-copy examples are at the end.
+# want to override. You need at least one [[sync]] (and, unless it uses the
+# `remote_fs` shortcut, one [[remote]]) for the daemon to do anything.
+# Ready-to-copy examples live in the README.
 
 # ===========================================================================
 # [daemon] — daemon-wide settings, plus the default values inherited by syncs.
@@ -80,14 +81,16 @@
 # # Human-friendly label shown in UIs; purely descriptive. (optional)
 # label = "My Nextcloud"
 #
-# # Backend: "webdav" | "git" | "local". (required)
+# # Backend: "webdav" | "git" | "filesystem". (required)
 # backend = "webdav"
 #
 # # Backend location. (required)
-# #   webdav → base URL, e.g. https://cloud.example.com/remote.php/dav/files/me/
-# #   git    → repository URL, e.g. https://github.com/me/dotfiles.git
-# #   local  → a directory path to mirror into, e.g. /mnt/backup/conflux
-# #            (leading `~` and $VARS are expanded, like a sync's `local`)
+# #   webdav     → base URL, e.g. https://cloud.example.com/remote.php/dav/files/me/
+# #   git        → repository URL, e.g. https://github.com/me/dotfiles.git
+# #   filesystem → a directory path to mirror into, e.g. /mnt/backup/conflux
+# #                (leading `~` and $VARS are expanded, like a sync's `local`).
+# #                For a one-off filesystem target you can skip the [[remote]]
+# #                entirely and set `remote_fs` on the sync instead (see below).
 # url = "https://cloud.example.com/remote.php/dav/files/me/"
 #
 # # Auth (optional): used by webdav and by git over HTTPS. Prefer
@@ -131,8 +134,17 @@
 #
 # # --- Mapping: which remote, which local dir, where on the remote ----------
 #
-# # Id of the [[remote]] this group syncs with. (required)
+# # Which remote this group syncs with. Set EXACTLY ONE of `remote` / `remote_fs`.
+# #
+# # `remote` — id of a [[remote]] block defined above. (required unless remote_fs)
 # remote = "example"
+# #
+# # `remote_fs` — shortcut for a filesystem target: give a directory path here
+# # instead of `remote` and conflux synthesizes a `filesystem` remote pointing at
+# # it, so you don't need a matching [[remote]] block. Leading `~` and $VARS are
+# # expanded. This is the preferred way to mirror to a local directory (backup
+# # disk, testing) and it supports `trigger = "watch-both"`.
+# remote_fs = "/mnt/backup/conflux"
 #
 # # Local root directory; leading `~` and $VARS are expanded. (required)
 # local = "~/.config"
@@ -191,7 +203,8 @@
 # # How this group is triggered: "manual" (only `conflux sync`), "timer"
 # # (every `interval`), "watch" (on local file changes, debounced), or
 # # "watch-both" (like "watch" but also watches the remote side; requires a
-# # `local` backend — an error otherwise). (required)
+# # `filesystem` backend or a `remote_fs` shortcut — an error otherwise).
+# # (required)
 # trigger = "watch"
 #
 # # Timer interval for `trigger = "timer"`. (default: inherits [daemon] interval)
@@ -216,84 +229,4 @@
 #
 # # Profiles this group belongs to. Omit for the implicit ["default"]; an
 # # explicit list (even []) is used verbatim, with no implicit "default".
-# profiles = ["desktop"]
-
-# ===========================================================================
-# Examples — copy, uncomment, and adapt. Each shows a common setup; unset
-# options fall back to the defaults documented above.
-# ===========================================================================
-
-# --- Remotes, one per backend type -----------------------------------------
-
-# WebDAV (e.g. Nextcloud), password fetched from the secret store on demand.
-# [[remote]]
-# id = "nextcloud"
-# backend = "webdav"
-# url  = "https://cloud.example.com/remote.php/dav/files/me/"
-# username = "me"
-# password_command = "secret-tool lookup service conflux"
-
-# Git repository (e.g. a dotfiles repo) over SSH — auth via your ssh-agent.
-# [[remote]]
-# id = "dotfiles"
-# backend = "git"
-# url  = "git@github.com:me/dotfiles.git"
-# branch = "main"
-# commit_msg_command = "printf 'conflux: %s' \"$(hostname)\""
-
-# Local directory mirror — great for a backup disk or for testing.
-# [[remote]]
-# id = "backup"
-# backend = "local"
-# url  = "/mnt/backup/conflux"
-
-# --- Syncs ------------------------------------------------------------------
-
-# Live two-way sync of selected ~/.config subtrees to Nextcloud, reacting to
-# local edits and polling the remote every few minutes for changes made
-# elsewhere. Only the `include` paths sync (default scope = "include"); anything
-# else under ~/.config is left completely alone.
-# [[sync]]
-# remote = "nextcloud"
-# local  = "~/.config"
-# remote_path = "config"
-# include = ["nvim", "fish", "kitty/kitty.conf"]
-# trigger = "watch"
-# pull_interval = "5m"
-
-# Dotfiles into $HOME with scope = "remote": every tracked file is pulled down
-# read-only, so pointing a shared dotfiles remote at your home directory can
-# never delete or overwrite the files you did NOT put in the repo. The handful
-# of dotfiles you want edited on this host AND pushed back are listed in
-# `include`, promoting just those to a full two-way sync.
-# [[sync]]
-# remote = "dotfiles"
-# local  = "~"
-# scope = "remote"
-# include = [".bashrc", ".config/nvim"]
-# trigger = "timer"
-# interval = "15m"
-
-# Read-only pull: download the whole remote tree and never upload. With an empty
-# `include`, scope = "remote" pushes nothing, so local changes stay local and any
-# extra local-only files are left untouched.
-# [[sync]]
-# remote = "nextcloud"
-# local  = "~/Documents/shared"
-# remote_path = "shared"
-# scope = "remote"
-# trigger = "timer"
-
-# Full backup of a dedicated ~/Documents tree to a local disk, mirrored 1:1.
-# `deletions = "allow"` opts this group out of the safe default so removals
-# propagate both ways — point it only at a directory you truly want kept
-# identical. Active only on the "desktop" profile.
-# [[sync]]
-# remote = "backup"
-# local  = "~/Documents"
-# remote_path = "documents"
-# scope = "mirror"
-# deletions = "allow"
-# trigger = "watch"
-# empty_dirs = "prune"
 # profiles = ["desktop"]

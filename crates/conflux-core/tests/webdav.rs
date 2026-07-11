@@ -43,10 +43,21 @@ fn config(local: &Path, url: &str, user: &str, pass: &str) -> Config {
 
 fn run(cfg: &Config, index: &mut Index) -> engine::SyncReport {
     let sync = &cfg.syncs[0];
-    let remote = cfg.remote(&sync.remote).unwrap();
+    let remote = cfg.remote(sync.remote_id()).unwrap();
     let backend = backend::build(remote, sync, Path::new("/unused-for-webdav"))
         .expect("backend should build");
-    engine::sync_group(sync, backend.as_ref(), index, false, conflux_core::model::EmptyDirMode::Ignore, conflux_core::model::Scope::Mirror, conflux_core::model::Deletions::Allow, 0, &[]).expect("sync should succeed")
+    engine::sync_group(
+        sync,
+        backend.as_ref(),
+        index,
+        false,
+        conflux_core::model::EmptyDirMode::Ignore,
+        conflux_core::model::Scope::Mirror,
+        conflux_core::model::Deletions::Allow,
+        0,
+        &[],
+    )
+    .expect("sync should succeed")
 }
 
 #[test]

@@ -3,9 +3,9 @@ resolver = "2"
 members = ["crates/conflux-core", "crates/conflux"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 authors = ["SelfRef"]
 repository = "https://github.com/SelfRef/conflux"
 rust-version = "1.85"

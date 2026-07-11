@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use conflux_core::config::{Remote, Sync};
-use conflux_core::model::{Deletions, EmptyDirMode, RemoteKind};
 use conflux_core::engine::{self, group_label, SyncSummary};
 use conflux_core::ipc::{GroupOutcome, GroupStatus, Request, Response, SyncTarget};
+use conflux_core::model::{Deletions, EmptyDirMode, RemoteKind};
 use conflux_core::{Config, Paths};
 use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
@@ -323,7 +323,7 @@ fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
 
         // Git can't store empty directories, so `empty_dirs` has no effect there.
         if resolve_empty_dirs(&st.config, sync) != EmptyDirMode::Ignore
-            && st.config.remote(&sync.remote).map(|r| r.backend) == Some(RemoteKind::Git)
+            && st.config.remote(sync.remote_id()).map(|r| r.backend) == Some(RemoteKind::Git)
         {
             warn!(
                 group = %label,
@@ -353,21 +353,35 @@ fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
             }
             conflux_core::model::Trigger::Watch => {
                 let debounce = resolve_debounce(&st.config, sync);
-                install_watch(&mut triggers, &sync.local, debounce, &submit, &label, "local");
+                install_watch(
+                    &mut triggers,
+                    &sync.local,
+                    debounce,
+                    submit,
+                    &label,
+                    "local",
+                );
             }
             conflux_core::model::Trigger::WatchBoth => {
                 let debounce = resolve_debounce(&st.config, sync);
-                install_watch(&mut triggers, &sync.local, debounce, &submit, &label, "local");
+                install_watch(
+                    &mut triggers,
+                    &sync.local,
+                    debounce,
+                    submit,
+                    &label,
+                    "local",
+                );
                 // Also watch the remote's filesystem path. Config validation
-                // guarantees a `local` backend here, so this always applies.
-                if let Some(r) = st.config.remote(&sync.remote) {
-                    if r.backend == RemoteKind::Local {
+                // guarantees a `filesystem` backend here, so this always applies.
+                if let Some(r) = st.config.remote(sync.remote_id()) {
+                    if r.backend == RemoteKind::Filesystem {
                         let remote_dir = conflux_core::backend::local::base_path(r, sync);
                         install_watch(
                             &mut triggers,
                             &remote_dir,
                             debounce,
-                            &submit,
+                            submit,
                             &label,
                             "remote",
                         );
@@ -379,7 +393,7 @@ fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
 
         // Independent of `trigger`: periodically pull the remote to pick up
         // remote-side changes. Disabled when unset or zero, and skipped when the
-        // remote is already watched live (`watch-both` on a local backend).
+        // remote is already watched live (`watch-both` on a filesystem backend).
         if remote_watched {
             if resolve_pull_interval(&st.config, sync).is_some_and(|d| !d.is_zero()) {
                 debug!(group = %label, "ignoring pull_interval: the remote is already watched via watch-both");
@@ -579,7 +593,11 @@ fn resolve_debounce(config: &Config, sync: &Sync) -> Duration {
 /// opt out even when a broader level enables it.
 fn resolve_pull_interval(config: &Config, sync: &Sync) -> Option<Duration> {
     sync.pull_interval
-        .or_else(|| config.remote(&sync.remote).and_then(|r| r.pull_interval))
+        .or_else(|| {
+            config
+                .remote(sync.remote_id())
+                .and_then(|r| r.pull_interval)
+        })
         .or(config.daemon.pull_interval)
 }
 
@@ -597,7 +615,11 @@ fn resolve_deletions(config: &Config, sync: &Sync) -> Deletions {
 /// per-sync, then per-remote, then the daemon default.
 fn resolve_max_file_size(config: &Config, sync: &Sync) -> u64 {
     sync.max_file_size
-        .or_else(|| config.remote(&sync.remote).and_then(|r| r.max_file_size))
+        .or_else(|| {
+            config
+                .remote(sync.remote_id())
+                .and_then(|r| r.max_file_size)
+        })
         .unwrap_or(config.daemon.max_file_size)
 }
 
@@ -625,7 +647,7 @@ fn resolve(st: &DaemonState, label: &str) -> Option<(Sync, Remote, PathBuf)> {
         .iter()
         .find(|s| group_label(s) == label)?
         .clone();
-    let remote = st.config.remote(&sync.remote)?.clone();
+    let remote = st.config.remote(sync.remote_id())?.clone();
     Some((sync, remote, st.paths.state.clone()))
 }
 
@@ -659,7 +681,7 @@ fn status_list(st: &DaemonState) -> Vec<GroupStatus> {
             let rt = st.status.get(&label).cloned().unwrap_or_default();
             GroupStatus {
                 label,
-                remote: s.remote.clone(),
+                remote: s.remote_id().to_string(),
                 root: s.local.display().to_string(),
                 trigger: format!("{:?}", s.trigger).to_lowercase(),
                 last_run: rt.last_run,
@@ -699,12 +721,12 @@ mod tests {
 
             [[remote]]
             id = "a"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/a"
 
             [[remote]]
             id = "b"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/b"
             pull_interval = "10m"
 
@@ -766,7 +788,7 @@ mod tests {
             r#"
             [[remote]]
             id = "r"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/r"
 
             [[sync]]
@@ -798,8 +820,14 @@ mod tests {
         // A group's `id` resolves to its canonical label.
         assert_eq!(labels_for_target(&st, &target("docs")), vec!["r:documents"]);
         // The `remote:remote_path` label works too, for groups with or without an id.
-        assert_eq!(labels_for_target(&st, &target("r:documents")), vec!["r:documents"]);
-        assert_eq!(labels_for_target(&st, &target("r:config")), vec!["r:config"]);
+        assert_eq!(
+            labels_for_target(&st, &target("r:documents")),
+            vec!["r:documents"]
+        );
+        assert_eq!(
+            labels_for_target(&st, &target("r:config")),
+            vec!["r:config"]
+        );
         // An unknown name matches nothing; `All` matches every active group.
         assert!(labels_for_target(&st, &target("nope")).is_empty());
         assert_eq!(labels_for_target(&st, &SyncTarget::All).len(), 2);
@@ -811,7 +839,7 @@ mod tests {
             r#"
             [[remote]]
             id = "a"
-            backend = "local"
+            backend = "filesystem"
             url = "/tmp/a"
 
             [[sync]]

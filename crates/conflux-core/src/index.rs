@@ -81,7 +81,7 @@ impl Index {
 
 /// Derive a filesystem-safe id for a sync group from its remote + remote path.
 fn group_id(sync: &Sync) -> String {
-    let raw = format!("{}__{}", sync.remote, sync.remote_path);
+    let raw = format!("{}__{}", sync.remote_id(), sync.remote_path);
     raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

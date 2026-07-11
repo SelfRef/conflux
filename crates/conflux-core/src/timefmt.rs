@@ -19,7 +19,9 @@ pub fn stamp(seconds: u64) -> String {
 /// Format Unix `seconds` as a human-readable datetime in the host's local time
 /// zone, e.g. `2026-07-11 14:34:56 +02:00` — used for `conflux status`.
 pub fn local(seconds: u64) -> String {
-    local_dt(seconds).format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    local_dt(seconds)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
 }
 
 #[cfg(test)]
