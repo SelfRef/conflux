@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use conflux_core::config::{Remote, Sync};
-use conflux_core::model::{EmptyDirMode, RemoteKind};
+use conflux_core::model::{Deletions, EmptyDirMode, RemoteKind};
 use conflux_core::engine::{self, group_label, SyncSummary};
 use conflux_core::ipc::{GroupOutcome, GroupStatus, Request, Response, SyncTarget};
 use conflux_core::{Config, Paths};
@@ -241,13 +241,22 @@ async fn run_one(
     label: &str,
     remote_refresh: bool,
 ) -> Option<GroupOutcome> {
-    let (sync, remote, state_dir, empty_dirs, max_file_size, exclude_defaults) = {
+    let (sync, remote, state_dir, empty_dirs, deletions, max_file_size, exclude_defaults) = {
         let st = state.lock().unwrap();
         let (sync, remote, state_dir) = resolve(&st, label)?;
         let empty_dirs = resolve_empty_dirs(&st.config, &sync);
+        let deletions = resolve_deletions(&st.config, &sync);
         let max_file_size = resolve_max_file_size(&st.config, &sync);
         let exclude_defaults = st.config.daemon.exclude.clone();
-        (sync, remote, state_dir, empty_dirs, max_file_size, exclude_defaults)
+        (
+            sync,
+            remote,
+            state_dir,
+            empty_dirs,
+            deletions,
+            max_file_size,
+            exclude_defaults,
+        )
     };
 
     let _guard = sync_lock.lock().await;
@@ -262,6 +271,7 @@ async fn run_one(
             &state_dir,
             remote_refresh,
             empty_dirs,
+            deletions,
             max_file_size,
             &exclude_defaults,
         )
@@ -576,9 +586,11 @@ fn resolve_pull_interval(config: &Config, sync: &Sync) -> Option<Duration> {
 /// Resolve empty-directory handling for a group: per-sync, then per-remote, then
 /// the daemon default.
 fn resolve_empty_dirs(config: &Config, sync: &Sync) -> EmptyDirMode {
-    sync.empty_dirs
-        .or_else(|| config.remote(&sync.remote).and_then(|r| r.empty_dirs))
-        .unwrap_or(config.daemon.empty_dirs)
+    sync.empty_dirs.unwrap_or(config.daemon.empty_dirs)
+}
+
+fn resolve_deletions(config: &Config, sync: &Sync) -> Deletions {
+    sync.deletions.unwrap_or(config.daemon.deletions)
 }
 
 /// Resolve the max synced file size (bytes; `0` = unlimited) for a group:

@@ -4,6 +4,7 @@ use conflux_core::backend;
 use conflux_core::engine::{self, SyncReport, Winner};
 use conflux_core::index::Index;
 use conflux_core::model::EmptyDirMode;
+use conflux_core::model::Deletions;
 use conflux_core::Config;
 use filetime::FileTime;
 use std::fs;
@@ -14,11 +15,19 @@ use std::path::{Path, PathBuf};
 /// Most tests exercise whole-tree behavior, so unless `extra` sets its own
 /// `scope` or `include`, the group defaults to `scope = "mirror"` (the shipped
 /// default `scope = "include"` with an empty `include` would sync nothing).
+/// Likewise, unless `extra` sets `deletions`, the group defaults to `deletions =
+/// "allow"` so deletion-propagation tests exercise the full two-way behavior
+/// (the shipped default is `deny`).
 fn config(local: &Path, remote: &Path, extra: &str) -> Config {
     let scope_line = if extra.contains("scope") || extra.contains("include") {
         ""
     } else {
         r#"scope = "mirror""#
+    };
+    let deletions_line = if extra.contains("deletions") {
+        ""
+    } else {
+        r#"deletions = "allow""#
     };
     let toml = format!(
         r#"
@@ -33,6 +42,7 @@ fn config(local: &Path, remote: &Path, extra: &str) -> Config {
         remote_path = "data"
         trigger = "manual"
         {scope_line}
+        {deletions_line}
         {extra}
         "#,
         remote = remote.display(),
@@ -54,6 +64,8 @@ fn run_mode(cfg: &Config, index: &mut Index, empty_dirs: EmptyDirMode) -> SyncRe
         .max_file_size
         .or(remote.max_file_size)
         .unwrap_or(cfg.daemon.max_file_size);
+    // Resolve deletions the way the daemon does: sync → daemon.
+    let deletions = sync.deletions.unwrap_or(cfg.daemon.deletions);
     engine::sync_group(
         sync,
         backend.as_ref(),
@@ -61,6 +73,7 @@ fn run_mode(cfg: &Config, index: &mut Index, empty_dirs: EmptyDirMode) -> SyncRe
         false,
         empty_dirs,
         sync.scope,
+        deletions,
         max_file_size,
         &cfg.daemon.exclude,
     )
@@ -164,6 +177,31 @@ fn propagates_deletes_both_ways() {
     assert_eq!(report.removed.len(), 2); // one deleted on each side
     assert!(!d.remote.join("data/keep.txt").exists());
     assert!(!d.local.join("fromremote.txt").exists());
+}
+
+#[test]
+fn deny_deletions_never_removes_files_on_either_side() {
+    let d = dirs();
+    // `mirror` scope would normally propagate deletes both ways; `deletions =
+    // "deny"` must override that regardless of scope.
+    let cfg = config(&d.local, &d.remote, r#"deletions = "deny""#);
+    let mut index = Index::default();
+
+    // Establish a baseline with a file on each side.
+    write(&d.local.join("keep.txt"), "1");
+    write(&d.remote.join("data/fromremote.txt"), "2");
+    run(&cfg, &mut index);
+    assert!(d.local.join("fromremote.txt").exists());
+    assert!(d.remote.join("data/keep.txt").exists());
+
+    // Delete one on each side; with `deny`, neither deletion propagates.
+    fs::remove_file(d.local.join("keep.txt")).unwrap();
+    fs::remove_file(d.remote.join("data/fromremote.txt")).unwrap();
+    let report = run(&cfg, &mut index);
+    assert_eq!(report.removed.len(), 0, "no deletions should be applied");
+    // The surviving copies are left in place on the other side.
+    assert!(d.remote.join("data/keep.txt").exists());
+    assert!(d.local.join("fromremote.txt").exists());
 }
 
 #[test]

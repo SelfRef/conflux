@@ -1,203 +1,180 @@
 # conflux
 
-A small Linux background service that syncs files — mainly `~/.config` files and
-scripts — between your machine and one or more remotes. Bidirectional by default,
-with **newer-wins** conflict resolution that never throws away data.
+A background file-sync daemon that keeps local directories in step with a
+remote. Point it at a WebDAV server (e.g. Nextcloud), a Git repository, or
+another local directory, pick when each group syncs (on file changes, on a
+timer, or manually), and how much of the tree it owns — from a read-only pull
+of tracked dotfiles to a full 1:1 mirror. A single `conflux` binary runs both
+the daemon and the CLI that controls it.
 
-- **Backends:** WebDAV (e.g. Nextcloud), git, and a local-directory mirror.
-- **Triggers:** manual, on a timer, or on file changes (debounced).
-- **One binary:** `conflux daemon` is the long-running service; the other
-  subcommands are CLI control that talk to it over a Unix socket.
-- **Runs per-user** (`systemd --user`) **or system-wide.**
+## Features
 
-> Status: a complete, tested implementation of milestones M0–M5. This is a
-> learning project; the code favors clarity over cleverness.
+- **Multiple backends** — sync against **WebDAV** (Nextcloud & friends),
+  **Git** (over HTTPS or SSH), or a **local** directory (backup disk, testing).
+- **Flexible triggers** — `watch` (react to local edits, debounced), `timer`
+  (every interval), `watch-both` (also watch a local remote), or `manual`.
+- **Scoped syncing** — `include` globs decide what syncs two-way, and `scope`
+  (`include` / `remote` / `local` / `mirror`) decides how everything else is
+  treated, so pointing a remote at `$HOME` can't clobber untracked files.
+- **Safe by default** — deletions are denied unless opted in, a configurable
+  max file size is enforced, and diverging edits are kept as local conflict
+  copies rather than overwritten.
+- **Periodic remote pulls** — a `pull_interval` catches changes made on other
+  hosts even for `watch`-triggered groups.
+- **Profiles** — one shared config can drive many hosts; each `--profile` gets
+  its own state dir and control socket and runs only its own sync groups.
+- **First-class systemd integration** — plain and profile-templated user and
+  system units, plus content-addressed (BLAKE3) change detection under the hood.
 
 ## Install
 
+### Arch Linux
+
+Three AUR packages are available — pick one:
+
+| Package | Source |
+| --- | --- |
+| `conflux` | stable release, built from source |
+| `conflux-git` | latest `master`, built from source |
+| `conflux-bin` | stable release, prebuilt binary from GitHub Releases |
+
+With an AUR helper such as [`yay`](https://github.com/Jguer/yay):
+
 ```sh
-cargo build --release
-install -Dm755 target/release/conflux ~/.local/bin/conflux   # or /usr/local/bin
+yay -S conflux        # or conflux-git / conflux-bin
+```
+
+Without an AUR helper, clone the package and build it with `makepkg`:
+
+```sh
+git clone https://aur.archlinux.org/conflux.git   # or conflux-git / conflux-bin
+cd conflux
+makepkg -si
+```
+
+### Local
+
+Build from source and install into your home directory (binary in
+`~/.local/bin`, config in `~/.config/conflux/`, systemd **user** units) with the
+bundled script:
+
+```sh
+./install.sh install
+```
+
+To install without rebuilding an existing `target/release/conflux`, add
+`--no-build`. To remove it again:
+
+```sh
+./install.sh uninstall           # keeps config and state
+./install.sh uninstall --purge   # also removes config and state
+```
+
+### System
+
+Install system-wide (binary in `/usr/local/bin`, config in `/etc/conflux/`,
+systemd **system** units, running as a dedicated `conflux` user) by adding
+`--system`; this requires root:
+
+```sh
+sudo ./install.sh install --system
+```
+
+Both a plain unit and a profile-templated unit are installed in each mode, so
+you can enable the implicit `default` profile or a named one:
+
+```sh
+sudo systemctl enable --now conflux            # default profile
+sudo systemctl enable --now conflux@desktop    # a named profile
+```
+
+Uninstall the same way you installed, with `--system` (add `--purge` to also
+drop the config, state, and system user):
+
+```sh
+sudo ./install.sh uninstall --system
 ```
 
 ## Configure
 
-Config is TOML. Default locations (override with `--config` or `$CONFLUX_CONFIG`):
+conflux reads a single TOML config file, resolved automatically:
 
-| | user mode | system mode (`--system`) |
-|---|---|---|
-| config | `~/.config/conflux/config.toml` | `/etc/conflux/config.toml` |
-| state/index | `~/.local/state/conflux/` | `/var/lib/conflux/` |
-| socket | `$XDG_RUNTIME_DIR/conflux.sock` | `/run/conflux/conflux.sock` |
+- **user mode:** `$XDG_CONFIG_HOME/conflux/config.toml` (usually
+  `~/.config/conflux/config.toml`)
+- **system mode:** `/etc/conflux/config.toml`
 
-See [`config.example.toml`](config.example.toml) for a fully-commented example.
-A minimal config:
+Override the path with `$CONFLUX_CONFIG` or `--config <path>`, and print the
+resolved locations with `conflux config paths`.
 
-```toml
-[[remote]]
-id = "nextcloud"
-backend = "webdav"
-url  = "https://cloud.example.com/remote.php/dav/files/me/"
-username = "me"
-password = "secret"            # or: password_command = "secret-tool lookup ..."
-
-[[sync]]
-remote      = "nextcloud"
-local       = "~/.config"      # one local root
-remote_path = "config"
-include     = ["nvim", "fish"] # only these paths sync (default: [] = nothing)
-trigger     = "watch"          # manual | timer | watch
-```
-
-Validate it before starting the daemon:
+A fully commented [`config.example.toml`](config.example.toml) documents every
+option at its default value; the installer drops it in as your starter config.
+You need at least one `[[remote]]` and one `[[sync]]` for the daemon to do
+anything. Validate your config before enabling the daemon:
 
 ```sh
 conflux config validate
-conflux config show       # print the parsed config
-conflux config paths      # show resolved config/state/socket paths
+conflux config show       # print the resolved configuration
+```
+
+### Example
+
+A dotfiles Git repo over HTTPS, pulled into `$HOME` read-only with a handful of
+files promoted to two-way sync:
+
+```toml
+[[remote]]
+id = "dotfiles"
+backend = "git"
+url = "https://github.com/me/dotfiles.git"
+branch = "main"
+# Auth for HTTPS; prefer a command over a plaintext password.
+username = "me"
+password_command = "secret-tool lookup service conflux"
+
+[[sync]]
+remote = "dotfiles"
+local = "~"
+# Pull every tracked file down read-only; only the paths in `include`
+# are pushed back, so untracked files in $HOME are never touched.
+scope = "remote"
+include = [".bashrc", ".config/nvim", ".config/fish"]
+trigger = "timer"
+interval = "15m"
 ```
 
 ## Run
 
-```sh
-# Foreground (for trying it out)
-conflux daemon
+### As a daemon (systemd)
 
-# Or as a user service (runs the "default" profile)
-cp systemd/conflux.user.service ~/.config/systemd/user/conflux.service
-systemctl --user daemon-reload
-systemctl --user enable --now conflux
-journalctl --user -u conflux -f
-
-# For another profile, use the template — the instance name is the profile
-cp systemd/conflux@.user.service ~/.config/systemd/user/conflux@.service
-systemctl --user enable --now conflux@desktop
-```
-
-Control the running daemon (add `--profile <name>` to target a non-default
-instance, e.g. `conflux --profile desktop status`):
+If you installed with the script, enable the unit for your mode. For a **user**
+install:
 
 ```sh
-conflux status                 # per-group last-run summary
-conflux sync                   # sync every group this daemon runs
-conflux sync nextcloud:config  # sync one group by its remote:remote_path label
-conflux sync dotfiles          # ...or by its `id`, if the [[sync]] sets one
-conflux reload                 # re-read the config file (also: systemctl reload / SIGHUP)
+systemctl --user enable --now conflux            # default profile
+systemctl --user enable --now conflux@desktop    # a named profile
 ```
 
-Each profile is a separate daemon with its own state dir and socket, so several
-(`conflux@desktop`, `conflux@laptop`, …) can run side by side on one host.
-
-## Key concepts
-
-- **Sync group** — one `local` root mapped to a remote's `remote_path` (optional;
-  omit it to map the remote's root). Its label is `remote:remote_path`, or just
-  `remote` when the path is the root. Optionally give it a short unique `id` to
-  target it as `conflux sync <id>`.
-- **`include`** — globs (relative to `local`) selecting what the group syncs,
-  where `*` matches one path segment and `**` matches across segments (a plain
-  name includes its whole subtree). An **empty list (the default) matches
-  nothing** — nothing syncs until you opt paths in; use `["**"]` to select
-  everything. What happens to paths *outside* `include` is decided by `scope`.
-- **`scope`** (sync-level only) — how the group treats paths not matched by
-  `include` (matched paths always sync both ways):
-  - `include` *(default)* — ignore everything outside `include`; it is never
-    pushed, pulled, or deleted. The safe default: aiming a remote at your `$HOME`
-    can't touch untracked files.
-  - `remote` — additionally **pull** every other remote file down read-only (the
-    remote overrides local; a diverging local copy is kept as a conflict copy).
-    List a path in `include` to promote it to a full two-way sync. Good for
-    dotfiles.
-  - `local` — the reverse of `remote`: additionally **push** every other local
-    file up (local overrides the remote; the losing remote version is kept as a
-    local conflict copy).
-  - `mirror` — sync the whole tree 1:1 both ways, including deletions, **ignoring
-    `include`**. ⚠️ This can delete files en masse on either side — use only for a
-    dedicated mirror directory, never against `$HOME`.
-- **`exclude`** — globs never synced in either direction, applied in *every*
-  scope. A sync's `exclude` is *added to* the `[daemon] exclude` list, which
-  defaults to well-known cruft (`.git`, `.svn`, `.hg`, `.DS_Store`, `Thumbs.db`,
-  `*.swp`); set `[daemon] exclude = []` to drop those defaults. Conflict copies
-  are always excluded.
-
-  For a read-only mirror (download the remote, never upload), use `scope =
-  "remote"` with an empty `include`; for the reverse, `scope = "local"`.
-- **`empty_dirs`** — how empty directories are handled (resolved per-sync →
-  per-remote → `[daemon]`): `ignore` (default, files only), `prune` (remove
-  empty dirs from both sides), or `mirror` (mirror empty dirs both ways, with
-  create/delete propagated via the index). Ignored for git remotes, which
-  cannot store empty directories.
-- **`max_file_size`** — largest file synced in either direction; bigger files
-  are skipped (logged at debug level). Resolved per-sync → per-remote →
-  `[daemon]`. Accepts a byte count or a size string (`"100MB"`, `"512KiB"`;
-  decimal units are ×1000, binary `…iB` units ×1024). `0` (or unset) means
-  unlimited. Defaults to `100MB`.
-- **Conflicts (newer-wins)** — if a file changed on both sides, the newer mtime
-  wins and the losing version is preserved next to it as
-  `name.conflux-conflict-YYYY-MM-DD_HH-MM-SS.ext` (local time; and logged). These
-  copies are never synced.
-- **Profiles** — tag groups with `profiles = ["desktop", ...]`; groups that omit
-  the setting belong to the implicit `"default"` profile. A host runs one profile,
-  selected (highest precedence first) by `conflux daemon --profile <name>`, then
-  `[daemon] profile`, defaulting to `"default"`. With systemd this is usually the
-  instance name: `conflux@desktop` runs the `desktop` profile, plain `conflux`
-  runs `default` — so one shared config drives different hosts.
-- **Triggers** — `manual` (only `conflux sync`), `timer` (`interval`, default 1h),
-  `watch` (inotify on the local tree, debounced by `debounce`: per-sync → daemon
-  default 5s), or `watch-both` (also watches the remote tree; requires a `local`
-  backend — config validation rejects it on webdav/git).
-- **`pull_interval`** — an *additional* periodic **pull-only** run (resolved per-sync
-  → per-remote → `[daemon]`, disabled when unset or `0`). Because `watch` only sees
-  local edits, set this to poll the remote for remote-side changes without waiting
-  for the next local change or full-sync tick.
-
-## Architecture
-
-A Cargo workspace:
-
-- **`conflux-core`** — the synchronous core: config, model, the reconciliation
-  `engine`, the per-group baseline `index`, and the `Backend` trait with `local`,
-  `webdav`, and `git` implementations.
-- **`conflux`** — the binary. `conflux daemon` is the only async part: a
-  single-worker scheduler driven by timer/watch/IPC triggers. Each sync runs on a
-  blocking thread and is serialized daemon-wide, so the engine is plain blocking
-  code and never races on a group's index.
-
-The engine does a three-way diff of the current local tree, the current remote
-snapshot, and the baseline index, then pushes/pulls/deletes per file and resolves
-conflicts. Remote change-detection ids are: WebDAV ETag, git blob-content hash,
-local content hash.
-
-## Caveats
-
-- **git mtimes are approximate.** git stores no per-file mtime, so newer-wins for
-  the git backend uses the repository's HEAD commit time for every file.
-- **Delete handling is conservative.** If one side deletes a file the other side
-  modified, the modification wins (the file is resurrected) and it's logged.
-- The baseline index is JSON per group under the state dir; fine for typical
-  dotfile/script trees.
-
-## Development
+For a **system** install, use the system manager with `sudo`:
 
 ```sh
-cargo test                       # unit + engine + git integration tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+sudo systemctl enable --now conflux
+sudo systemctl enable --now conflux@desktop
 ```
 
-Two integration tests reach external services and are opt-in:
+To run the daemon in the foreground instead (for debugging), run
+`conflux daemon` directly; set `CONFLUX_LOG=debug` for verbose output.
+
+### CLI commands
+
+The CLI talks to the running daemon over its control socket. Add `--system` for
+a system daemon and `--profile <name>` to target a specific profile.
 
 ```sh
-# git: uses a local bare repo, always runs (no network)
-cargo test -p conflux-core --test git
-
-# webdav: needs a server; e.g. with docker + rclone:
-docker run --rm -p 4918:8080 -v /tmp/dav:/data rclone/rclone \
-  serve webdav /data --addr :8080 --user test --pass test123
-CONFLUX_WEBDAV_URL=http://localhost:4918/ CONFLUX_WEBDAV_USER=test \
-  CONFLUX_WEBDAV_PASS=test123 cargo test -p conflux-core --test webdav
+conflux status              # show each sync group and its last run
+conflux sync                # trigger a sync now for every group
+conflux sync dotfiles       # trigger just one group (by id or remote:path)
+conflux reload              # reload the config without restarting
+conflux config validate     # check the config file
+conflux config show         # print the resolved config
+conflux config paths        # print config/state/socket paths
 ```
-
-## License
-
-GPLv3

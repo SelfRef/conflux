@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::hash::hash_bytes;
 use crate::index::Index;
 use crate::matcher::Matcher;
-use crate::model::{EmptyDirMode, FileMeta, Scope};
+use crate::model::{Deletions, EmptyDirMode, FileMeta, Scope};
 use crate::relpath::RelPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -125,12 +125,14 @@ pub fn group_label(sync: &Sync) -> String {
 /// `remote_refresh` marks a periodic `pull_interval` poll: for a bidirectional
 /// group it applies only remote-originated changes and leaves local-side changes
 /// for the normal trigger, so it never fights the bidirectional reconcile.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     sync: &Sync,
     remote: &Remote,
     state_dir: &Path,
     remote_refresh: bool,
     empty_dirs: EmptyDirMode,
+    deletions: Deletions,
     max_file_size: u64,
     exclude_defaults: &[String],
 ) -> Result<SyncReport> {
@@ -144,6 +146,7 @@ pub fn run(
         remote_refresh,
         empty_dirs,
         sync.scope,
+        deletions,
         max_file_size,
         exclude_defaults,
     )?;
@@ -217,6 +220,17 @@ fn key_mode(scope: Scope, included: bool) -> KeyMode {
     }
 }
 
+/// Apply the group's [`Deletions`] policy to a decided action. Under
+/// [`Deletions::Deny`] the two file-deletion actions become no-ops, so a file
+/// removed on one side is left untouched on the other. Non-deletion actions
+/// (and index-only `DropIndex`, which removes no file) pass through unchanged.
+fn apply_deletions_policy(action: Action, deletions: Deletions) -> Action {
+    match (deletions, action) {
+        (Deletions::Deny, Action::DeleteLocal | Action::DeleteRemote) => Action::Nothing,
+        _ => action,
+    }
+}
+
 /// If `action` would transfer a file whose size exceeds `limit`, return that
 /// size (so the caller can skip and log it). `limit == 0` means no cap. Actions
 /// that move no bytes (deletes, index-only, nothing) are never capped. A
@@ -262,6 +276,7 @@ pub fn sync_group(
     remote_refresh: bool,
     empty_dirs: EmptyDirMode,
     scope: Scope,
+    deletions: Deletions,
     max_file_size: u64,
     exclude_defaults: &[String],
 ) -> Result<SyncReport> {
@@ -307,6 +322,11 @@ pub fn sync_group(
             }
             KeyMode::Skip => unreachable!("skipped above"),
         };
+
+        // `deletions = deny` neutralizes every file deletion, in either
+        // direction and regardless of scope, so a removal on one side is never
+        // propagated to the other.
+        let action = apply_deletions_policy(action, deletions);
 
         // Skip files whose transfer would exceed the configured size cap, in
         // either direction. The index is left untouched, so the file simply
@@ -852,6 +872,40 @@ mod tests {
         assert_eq!(decide_push_only(Removed, Same, true), Action::DeleteRemote);
         // Remote-only changes are ignored.
         assert_eq!(decide_push_only(Same, Modified, true), Action::Nothing);
+    }
+
+    #[test]
+    fn deny_deletions_neutralizes_both_delete_actions() {
+        // Under `deny`, neither side's delete is applied.
+        assert_eq!(
+            apply_deletions_policy(Action::DeleteLocal, Deletions::Deny),
+            Action::Nothing
+        );
+        assert_eq!(
+            apply_deletions_policy(Action::DeleteRemote, Deletions::Deny),
+            Action::Nothing
+        );
+        // Non-deletion actions are untouched.
+        assert_eq!(
+            apply_deletions_policy(Action::Pull, Deletions::Deny),
+            Action::Pull
+        );
+        assert_eq!(
+            apply_deletions_policy(Action::DropIndex, Deletions::Deny),
+            Action::DropIndex
+        );
+    }
+
+    #[test]
+    fn allow_deletions_passes_actions_through() {
+        assert_eq!(
+            apply_deletions_policy(Action::DeleteLocal, Deletions::Allow),
+            Action::DeleteLocal
+        );
+        assert_eq!(
+            apply_deletions_policy(Action::DeleteRemote, Deletions::Allow),
+            Action::DeleteRemote
+        );
     }
 
     #[test]

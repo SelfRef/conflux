@@ -79,6 +79,20 @@ pub enum EmptyDirMode {
     Mirror,
 }
 
+/// Whether a sync group is allowed to delete files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Deletions {
+    /// Never delete a file on either side, regardless of `scope` (default). A
+    /// file removed on one side is left in place on the other and the deletion
+    /// is not propagated, guarding against accidental data loss.
+    #[default]
+    Deny,
+    /// Propagate deletions in both directions: a file removed on one side is
+    /// removed on the other.
+    Allow,
+}
+
 /// What a sync group covers, relative to its `include` globs. `exclude` always
 /// applies on top, in every variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -100,7 +114,9 @@ pub enum Scope {
     /// remote (a conflict copy of the losing remote version is still kept
     /// locally).
     Local,
-    /// Sync the whole tree 1:1 in both directions, including deletions, ignoring
-    /// `include`. This can delete files en masse on either side, so use with care.
+    /// Sync the whole tree 1:1 in both directions, ignoring `include`. Deletions
+    /// are propagated only when the group's [`Deletions`] policy is `allow`
+    /// (with `allow` this can delete files en masse on either side, so use with
+    /// care); the default `deny` mirrors creates and edits but never deletes.
     Mirror,
 }

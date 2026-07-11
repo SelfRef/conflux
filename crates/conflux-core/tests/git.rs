@@ -44,7 +44,7 @@ fn run(cfg: &Config, index: &mut Index, state: &Path) -> SyncReport {
     let sync = &cfg.syncs[0];
     let remote = cfg.remote(&sync.remote).unwrap();
     let backend = backend::build(remote, sync, state).expect("backend should build");
-    engine::sync_group(sync, backend.as_ref(), index, false, conflux_core::model::EmptyDirMode::Ignore, conflux_core::model::Scope::Mirror, 0, &[]).expect("sync should succeed")
+    engine::sync_group(sync, backend.as_ref(), index, false, conflux_core::model::EmptyDirMode::Ignore, conflux_core::model::Scope::Mirror, conflux_core::model::Deletions::Allow, 0, &[]).expect("sync should succeed")
 }
 
 #[test]

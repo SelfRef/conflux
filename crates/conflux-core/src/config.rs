@@ -1,7 +1,7 @@
 //! TOML configuration schema, loading, normalization, and validation.
 
 use crate::error::{Error, Result};
-use crate::model::{EmptyDirMode, RemoteKind, Scope, Trigger};
+use crate::model::{Deletions, EmptyDirMode, RemoteKind, Scope, Trigger};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -72,9 +72,13 @@ pub struct DaemonConfig {
     /// opt a single group out when a broader level enables it).
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub pull_interval: Option<Duration>,
-    /// Default empty-directory handling, overridable per remote/sync.
+    /// Default empty-directory handling, overridable per sync.
     #[serde(default)]
     pub empty_dirs: EmptyDirMode,
+    /// Default deletion policy, overridable per sync. `deny` (default) never
+    /// deletes on either side; `allow` propagates deletions. See [`Deletions`].
+    #[serde(default)]
+    pub deletions: Deletions,
     /// Default maximum size, in bytes, of a file synced in either direction;
     /// larger files are skipped. Accepts a byte count or a size string like
     /// `"100MB"`/`"512KiB"`. `0` means unlimited. Overridable per remote/sync.
@@ -105,6 +109,7 @@ impl Default for DaemonConfig {
             interval: DEFAULT_INTERVAL,
             pull_interval: None,
             empty_dirs: EmptyDirMode::default(),
+            deletions: Deletions::default(),
             max_file_size: default_max_file_size(),
             exclude: default_exclude(),
             profile: default_profile(),
@@ -145,10 +150,6 @@ pub struct Remote {
     /// default; overridden per sync). See [`DaemonConfig::pull_interval`].
     #[serde(default, deserialize_with = "de::opt_duration")]
     pub pull_interval: Option<Duration>,
-    /// Remote-level empty-directory handling (overrides the daemon default;
-    /// overridden per sync). Ignored for git remotes, which cannot store them.
-    #[serde(default)]
-    pub empty_dirs: Option<EmptyDirMode>,
     /// Remote-level maximum synced file size in bytes (overrides the daemon
     /// default; overridden per sync). `0` means unlimited. See
     /// [`DaemonConfig::max_file_size`].
@@ -186,6 +187,11 @@ pub struct Sync {
     /// `remote`, `local`, or `mirror`. See [`Scope`]. Sync-level only.
     #[serde(default)]
     pub scope: Scope,
+    /// Whether this group may delete files: `deny` never deletes on either side,
+    /// regardless of `scope`; `allow` propagates deletions. Overrides the daemon
+    /// default; falls back to `deny` when unset everywhere. See [`Deletions`].
+    #[serde(default)]
+    pub deletions: Option<Deletions>,
     /// How this group is triggered.
     pub trigger: Trigger,
     /// Timer interval; defaults to one hour when `trigger = "timer"`.
@@ -243,6 +249,15 @@ impl Config {
 
     /// Expand `~`/env vars in local roots and trim slashes off remote paths.
     fn normalize(&mut self) {
+        for remote in &mut self.remotes {
+            // A `local` backend's url is a filesystem path, so expand `~`/$VARS
+            // in it just like a sync root. Other backends use it as a URL.
+            if remote.backend == RemoteKind::Local {
+                remote.url = expand_path(Path::new(&remote.url))
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
         for sync in &mut self.syncs {
             sync.local = expand_path(&sync.local);
             // An empty / all-slashes `remote_path` means "the remote root".
@@ -678,6 +693,42 @@ mod tests {
     }
 
     #[test]
+    fn expands_tilde_in_local_backend_url() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let cfg = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "backup"
+            backend = "local"
+            url = "~/remote-dir"
+
+            [[sync]]
+            remote = "backup"
+            local = "/tmp/a"
+            remote_path = "x"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.remotes[0].url, format!("{home}/remote-dir"));
+    }
+
+    #[test]
+    fn leaves_non_local_backend_url_untouched() {
+        // A webdav/git url is not a filesystem path and must not be path-expanded.
+        let cfg = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "nc"
+            backend = "webdav"
+            url = "https://example.com/dav/"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.remotes[0].url, "https://example.com/dav/");
+    }
+
+    #[test]
     fn parses_optional_sync_id_and_rejects_duplicates() {
         let base = r#"
             [[remote]]
@@ -758,11 +809,19 @@ mod tests {
         // `[daemon] exclude` defaults to the well-known list.
         assert_eq!(cfg.daemon.exclude, default_exclude());
         assert!(cfg.daemon.exclude.iter().any(|e| e == "**/.git/**"));
+        // Deletions default to the safe `deny` at every level.
+        assert_eq!(cfg.daemon.deletions, Deletions::Deny);
         let sync = &cfg.syncs[0];
         // Unset `scope`/`include` => the safe default: `include` scope, empty
         // include list (nothing synced until the user opts paths in).
         assert_eq!(sync.scope, Scope::Include);
         assert!(sync.include.is_empty());
+        // Unset `deletions` => inherits, resolving to the daemon default `deny`.
+        assert_eq!(sync.deletions, None);
+        assert_eq!(
+            sync.deletions.unwrap_or(cfg.daemon.deletions),
+            Deletions::Deny
+        );
         // No per-sync interval => falls back to the daemon default.
         assert_eq!(sync.interval, None);
         assert_eq!(sync.effective_interval(cfg.daemon.interval), DEFAULT_INTERVAL);
@@ -786,6 +845,7 @@ mod tests {
             remote_path: String::new(),
             include: vec![],
             scope: Scope::default(),
+            deletions: None,
             trigger: Trigger::Manual,
             interval: None,
             debounce: None,

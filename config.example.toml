@@ -1,18 +1,21 @@
-# Example conflux configuration — reference of every option.
+# Example conflux configuration — a reference of every option.
 #
-# Resolved automatically from:
+# Config file location (resolved automatically):
 #   user mode:   $XDG_CONFIG_HOME/conflux/config.toml   (e.g. ~/.config/conflux/config.toml)
 #   system mode: /etc/conflux/config.toml
-# Override with $CONFLUX_CONFIG or `--config <path>`.
+# Override the path with $CONFLUX_CONFIG or `--config <path>`.
 #
-# Durations are humantime strings: "2s", "500ms", "3m", "1h", "0s" (= off).
-# Every option below is commented out and shown with its default value, so this
+# Value formats:
+#   durations — humantime strings: "2s", "500ms", "3m", "1h", "0s" (= off).
+#   sizes     — a byte count or a unit: KB/MB/GB/TB (×1000) or KiB/MiB/GiB (×1024).
+#
+# Every option below is commented out and shown at its default value, so this
 # file documents the defaults without changing them — uncomment only what you
 # want to override. You need at least one [[remote]] and one [[sync]] for the
-# daemon to do anything.
+# daemon to do anything; ready-to-copy examples are at the end.
 
 # ===========================================================================
-# [daemon] — daemon-wide settings and the defaults inherited by remotes/syncs.
+# [daemon] — daemon-wide settings, plus the default values inherited by syncs.
 # ===========================================================================
 # [daemon]
 
@@ -20,41 +23,51 @@
 # (The CONFLUX_LOG env var, if set, overrides this.)
 # log_level = "info"
 
-# Default debounce for `watch` triggers: how long to wait for filesystem
-# activity to settle before syncing. Overridable per remote and per sync.
+# Which profile this host runs: only syncs whose `profiles` include this value
+# are active, and "default" matches syncs that omit `profiles`. Usually left at
+# "default"; `conflux --profile <name> daemon` overrides it per host and gives
+# each profile its own state dir + socket so instances can run in parallel.
+# profile = "default"
+
+# --- Defaults inherited by every sync. Override any of them per-sync;
+#     `pull_interval` and `max_file_size` can also be set per-remote. ----------
+
+# Debounce for `watch` triggers: how long to wait for filesystem activity to
+# settle before syncing.
 # debounce = "5s"
 
-# Default interval for `timer` triggers. Overridable per sync.
+# Interval for `timer` triggers.
 # interval = "1h"
 
-# Default cadence for periodic remote pulls — an extra pull-only run that
-# catches remote-side changes (a `watch` trigger only sees LOCAL edits).
-# "0s" (or unset) disables it. Overridable per remote and per sync.
+# Cadence for periodic remote pulls — an extra pull-only run that catches
+# remote-side changes (a `watch` trigger only sees LOCAL edits). "0s" (or unset)
+# disables it.
 # pull_interval = "0s"
 
-# Default empty-directory handling. Overridable per remote and per sync.
+# Empty-directory handling:
 #   "ignore" — sync files only; leave empty directories untouched.
 #   "prune"  — remove empty directories from both sides after a sync.
 #   "mirror" — mirror empty directories to both sides (create + delete).
 # Ignored for git remotes, which cannot store empty directories.
 # empty_dirs = "ignore"
 
-# Largest file that will be synced in EITHER direction; anything bigger is
-# skipped (logged at debug level). Accepts a byte count or a size string with a
-# decimal (KB/MB/GB/TB, ×1000) or binary (KiB/MiB/GiB, ×1024) unit. "0" (or
-# unset) means unlimited. Overridable per remote and per sync. (default: 100MB)
+# Deletion policy:
+#   "deny"   — never delete a file on either side, regardless of a sync's
+#              `scope`. A file removed on one side is left in place on the other.
+#              Guards against accidental data loss (empty dirs are still governed
+#              by `empty_dirs`).
+#   "allow"  — propagate deletions: a file removed on one side is removed on the
+#              other.
+# deletions = "deny"
+
+# Largest file synced in EITHER direction; anything bigger is skipped (logged at
+# debug level). "0" (or unset) means unlimited.
 # max_file_size = "100MB"
 
-# Globs excluded from every sync, added to each sync's own `exclude` (and the
+# Globs excluded from every sync, ADDED to each sync's own `exclude` (and the
 # always-forced conflict-copy glob). Defaults to well-known VCS/OS cruft; set to
 # [] to sync everything.
 # exclude = ["**/.git/**", "**/.svn/**", "**/.hg/**", "**/.DS_Store", "**/Thumbs.db", "**/*.swp"]
-
-# Which profile this host runs: only syncs whose `profiles` include this value
-# are active. "default" matches syncs that omit `profiles`. Usually left at
-# "default"; `conflux --profile <name> daemon` overrides it per host and gives
-# each profile its own state dir + socket so instances can run in parallel.
-# profile = "default"
 
 # ===========================================================================
 # [[remote]] — a remote connection. Define one block per remote you sync with.
@@ -74,6 +87,7 @@
 # #   webdav → base URL, e.g. https://cloud.example.com/remote.php/dav/files/me/
 # #   git    → repository URL, e.g. https://github.com/me/dotfiles.git
 # #   local  → a directory path to mirror into, e.g. /mnt/backup/conflux
+# #            (leading `~` and $VARS are expanded, like a sync's `local`)
 # url = "https://cloud.example.com/remote.php/dav/files/me/"
 #
 # # Auth (optional): used by webdav and by git over HTTPS. Prefer
@@ -94,16 +108,18 @@
 # commit_msg_command = "printf 'sync from %s' \"$(hostname)\""
 # commit_msg_command = "git diff --cached --shortstat"
 #
-# # Remote-level defaults inherited by this remote's syncs (each optional; a
-# # per-sync value overrides these). Note: `scope` is sync-level only.
+# # Remote-level overrides of the [daemon] defaults, inherited by this remote's
+# # syncs (a per-sync value still wins). Only these two can be set per-remote;
+# # `debounce`, `interval`, `empty_dirs`, `deletions`, and `scope` are not.
 # pull_interval = "10m"        # overrides the [daemon] default
-# empty_dirs = "mirror"        # overrides the [daemon] default
 # max_file_size = "250MB"      # overrides the [daemon] default ("0" = unlimited)
 
 # ===========================================================================
 # [[sync]] — a sync group: one local directory mapped to a path on a remote.
 # ===========================================================================
 # [[sync]]
+#
+# # --- Identity -------------------------------------------------------------
 #
 # # Short id used to target this group from the CLI, e.g. `conflux sync dotfiles`
 # # (the `remote:remote_path` label works as a target too). Must be unique across
@@ -112,6 +128,8 @@
 #
 # # Human-friendly label shown in UIs; purely descriptive. (optional)
 # label = "Config files"
+#
+# # --- Mapping: which remote, which local dir, where on the remote ----------
 #
 # # Id of the [[remote]] this group syncs with. (required)
 # remote = "example"
@@ -123,17 +141,14 @@
 # # root. Surrounding slashes are trimmed. (default: "")
 # remote_path = "config"
 #
+# # --- What gets synced -----------------------------------------------------
+#
 # # Globs (relative to `local`) selecting what this group syncs. `*` matches one
 # # path segment, `**` matches across segments, and a plain name includes its
 # # whole subtree. An EMPTY list (the default) matches NOTHING — nothing is
 # # synced until you opt paths in; use ["**"] to select everything. How paths
-# # OUTSIDE this list are treated is governed by `scope` below. (default: [])
+# # OUTSIDE this list are treated is governed by `scope`. (default: [])
 # include = ["nvim", "fish/*", "**/*.conf"]
-#
-# # Globs (relative to `local`) never synced in either direction. ADDED to the
-# # [daemon] `exclude` defaults, not replacing them. Applied in every `scope`.
-# # (default: [])
-# exclude = ["*.log", "cache/**"]
 #
 # # What this group covers, relative to `include`. Sync-level only. Paths matched
 # # by `include` always sync both ways (creates, edits, deletes); `scope` decides
@@ -148,11 +163,30 @@
 # #   "local"   — the reverse of "remote": additionally PUSH every other local
 # #               file up; local overrides the remote (losing remote version kept
 # #               as a local conflict copy).
-# #   "mirror"  — sync the whole tree 1:1 both ways, including deletions, IGNORING
-# #               `include`. WARNING: this can delete files en masse on either
-# #               side (e.g. an empty/stale remote will wipe your local tree, and
-# #               vice versa). Use only for a dedicated mirror, never against $HOME.
+# #   "mirror"  — sync the whole tree 1:1 both ways, IGNORING `include`. With
+# #               `deletions = "allow"` this also propagates deletions, which can
+# #               wipe files en masse on either side (e.g. an empty/stale remote
+# #               will clear your local tree, and vice versa) — use only for a
+# #               dedicated mirror, never against $HOME. The default `deletions =
+# #               "deny"` mirrors creates and edits but never deletes.
 # scope = "include"
+#
+# # Globs (relative to `local`) never synced in either direction. ADDED to the
+# # [daemon] `exclude` defaults, not replacing them. Applied in every `scope`.
+# # (default: [])
+# exclude = ["*.log", "cache/**"]
+#
+# # Whether this group may delete files. (default: inherits [daemon] deletions)
+# #   "deny"   — never delete a file on either side, regardless of `scope`
+# #              (including "mirror"). A file removed on one side is left in place
+# #              on the other and the deletion is not propagated. Guards against
+# #              accidental data loss (empty dirs are still governed by
+# #              `empty_dirs`).
+# #   "allow"  — propagate deletions: a file removed on one side is removed on
+# #              the other.
+# deletions = "deny"
+#
+# # --- When it syncs --------------------------------------------------------
 #
 # # How this group is triggered: "manual" (only `conflux sync`), "timer"
 # # (every `interval`), "watch" (on local file changes, debounced), or
@@ -163,15 +197,17 @@
 # # Timer interval for `trigger = "timer"`. (default: inherits [daemon] interval)
 # interval = "30m"
 #
-# # Watch debounce override. (default: inherits remote → [daemon] debounce)
+# # Watch debounce override. (default: inherits [daemon] debounce)
 # debounce = "3s"
 #
 # # Periodic pull-only cadence to catch remote-side changes, independent of
 # # `trigger`. "0s" disables. (default: inherits remote → [daemon] pull_interval)
 # pull_interval = "5m"
 #
+# # --- Other behavior -------------------------------------------------------
+#
 # # Empty-directory handling: "ignore" | "prune" | "mirror". Ignored for git.
-# # (default: inherits remote → [daemon] empty_dirs)
+# # (default: inherits [daemon] empty_dirs)
 # empty_dirs = "mirror"
 #
 # # Largest file synced in either direction; bigger files are skipped. "0" =
@@ -248,14 +284,16 @@
 # scope = "remote"
 # trigger = "timer"
 
-# Full backup of a dedicated ~/Documents tree to a local disk, mirrored 1:1
-# (scope = "mirror" — deletions propagate both ways, so only point it at a
-# directory you truly want kept identical), active only on the "desktop" profile.
+# Full backup of a dedicated ~/Documents tree to a local disk, mirrored 1:1.
+# `deletions = "allow"` opts this group out of the safe default so removals
+# propagate both ways — point it only at a directory you truly want kept
+# identical. Active only on the "desktop" profile.
 # [[sync]]
 # remote = "backup"
 # local  = "~/Documents"
 # remote_path = "documents"
 # scope = "mirror"
+# deletions = "allow"
 # trigger = "watch"
 # empty_dirs = "prune"
 # profiles = ["desktop"]
