@@ -54,7 +54,7 @@ struct Submitter {
 }
 
 impl Submitter {
-    /// Queue a full (bidirectional, per the group's `direction`) sync.
+    /// Queue a full sync (applies both local and remote changes, per the group's scope).
     fn submit(&self, label: String) {
         self.enqueue(label, false);
     }
@@ -135,6 +135,9 @@ async fn run_async(config: Config, paths: Paths) -> anyhow::Result<()> {
     // Sync every active group once at startup, warning if there is nothing to do.
     {
         let st = state.lock().unwrap();
+        for lint in st.config.warnings() {
+            warn!("{lint}");
+        }
         let labels = active_labels(&st);
         if labels.is_empty() {
             if st.config.syncs.is_empty() {
@@ -238,17 +241,20 @@ async fn run_one(
     label: &str,
     remote_refresh: bool,
 ) -> Option<GroupOutcome> {
-    let (sync, remote, state_dir, empty_dirs, exclude_defaults) = {
+    let (sync, remote, state_dir, empty_dirs, max_file_size, exclude_defaults) = {
         let st = state.lock().unwrap();
         let (sync, remote, state_dir) = resolve(&st, label)?;
         let empty_dirs = resolve_empty_dirs(&st.config, &sync);
+        let max_file_size = resolve_max_file_size(&st.config, &sync);
         let exclude_defaults = st.config.daemon.exclude.clone();
-        (sync, remote, state_dir, empty_dirs, exclude_defaults)
+        (sync, remote, state_dir, empty_dirs, max_file_size, exclude_defaults)
     };
 
     let _guard = sync_lock.lock().await;
-    let kind = if remote_refresh { "remote pull" } else { "sync" };
-    debug!(group = %label, "running {kind}");
+    // A periodic remote-refresh run only brings changes in — call that "pulled"
+    // rather than "synced".
+    let verb = if remote_refresh { "pulled" } else { "synced" };
+    debug!(group = %label, "running {verb}");
     let join = tokio::task::spawn_blocking(move || {
         engine::run(
             &sync,
@@ -256,6 +262,7 @@ async fn run_one(
             &state_dir,
             remote_refresh,
             empty_dirs,
+            max_file_size,
             &exclude_defaults,
         )
     })
@@ -267,9 +274,9 @@ async fn run_one(
                 warn!(group = %label, path = %c.path, "conflict resolved ({:?}); copy at {}", c.winner, c.conflict_copy.display());
             }
             if !report.is_empty() {
-                info!(group = %label, "synced: {}", SyncSummary::from(&report));
+                info!(group = %label, "{verb}: {}", SyncSummary::from(&report));
             } else {
-                debug!(group = %label, "{kind} complete, no changes");
+                debug!(group = %label, "{verb} complete, no changes");
             }
             (Some(SyncSummary::from(&report)), None)
         }
@@ -530,6 +537,9 @@ fn reload(state: &Shared) -> (bool, String) {
     let config_path = { state.lock().unwrap().paths.config.clone() };
     match Config::load(&config_path) {
         Ok(config) => {
+            for lint in config.warnings() {
+                warn!("{lint}");
+            }
             let mut st = state.lock().unwrap();
             let groups = config.syncs.len();
             st.config = config;
@@ -571,6 +581,14 @@ fn resolve_empty_dirs(config: &Config, sync: &Sync) -> EmptyDirMode {
         .unwrap_or(config.daemon.empty_dirs)
 }
 
+/// Resolve the max synced file size (bytes; `0` = unlimited) for a group:
+/// per-sync, then per-remote, then the daemon default.
+fn resolve_max_file_size(config: &Config, sync: &Sync) -> u64 {
+    sync.max_file_size
+        .or_else(|| config.remote(&sync.remote).and_then(|r| r.max_file_size))
+        .unwrap_or(config.daemon.max_file_size)
+}
+
 fn is_active(sync: &Sync, active_profile: Option<&str>) -> bool {
     match active_profile {
         None => true,
@@ -600,18 +618,21 @@ fn resolve(st: &DaemonState, label: &str) -> Option<(Sync, Remote, PathBuf)> {
 }
 
 /// Resolve a sync request to labels, always scoped to this daemon's active
-/// profile: `All` covers every group the daemon runs, `Group` picks one of them.
+/// profile: `All` covers every group the daemon runs, `Group` picks the one
+/// whose `id` or `remote:remote_path` label matches.
 fn labels_for_target(st: &DaemonState, target: &SyncTarget) -> Vec<String> {
     let active_profile = st.config.daemon.profile.as_deref();
     st.config
         .syncs
         .iter()
         .filter(|s| is_active(s, active_profile))
-        .map(group_label)
-        .filter(|label| match target {
+        .filter(|s| match target {
             SyncTarget::All => true,
-            SyncTarget::Group(l) => label == l,
+            SyncTarget::Group(name) => {
+                s.id.as_deref() == Some(name.as_str()) || &group_label(s) == name
+            }
         })
+        .map(group_label)
         .collect()
 }
 
@@ -725,6 +746,51 @@ mod tests {
             resolve_pull_interval(&config, &sync_named(&config, "opt-out")),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn sync_target_matches_by_id_or_label() {
+        let config = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/r"
+
+            [[sync]]
+            id = "docs"
+            remote = "r"
+            local = "/tmp/a"
+            remote_path = "documents"
+            trigger = "manual"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/b"
+            remote_path = "config"
+            trigger = "manual"
+        "#,
+        )
+        .unwrap();
+        let st = DaemonState {
+            config,
+            paths: Paths {
+                config: "/x".into(),
+                state: "/x".into(),
+                socket: "/x".into(),
+            },
+            status: BTreeMap::new(),
+        };
+
+        let target = |s: &str| SyncTarget::Group(s.to_string());
+        // A group's `id` resolves to its canonical label.
+        assert_eq!(labels_for_target(&st, &target("docs")), vec!["r:documents"]);
+        // The `remote:remote_path` label works too, for groups with or without an id.
+        assert_eq!(labels_for_target(&st, &target("r:documents")), vec!["r:documents"]);
+        assert_eq!(labels_for_target(&st, &target("r:config")), vec!["r:config"]);
+        // An unknown name matches nothing; `All` matches every active group.
+        assert!(labels_for_target(&st, &target("nope")).is_empty());
+        assert_eq!(labels_for_target(&st, &SyncTarget::All).len(), 2);
     }
 
     #[test]

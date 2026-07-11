@@ -1,7 +1,7 @@
 //! TOML configuration schema, loading, normalization, and validation.
 
 use crate::error::{Error, Result};
-use crate::model::{Direction, EmptyDirMode, PullScope, RemoteKind, Trigger};
+use crate::model::{EmptyDirMode, RemoteKind, Scope, Trigger};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 
 /// Default timer interval when a `timer` sync omits `interval`.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Default `max_file_size` when none is configured at any level: 100 MB.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1000 * 1000;
 
 /// Top-level parsed configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,6 +75,15 @@ pub struct DaemonConfig {
     /// Default empty-directory handling, overridable per remote/sync.
     #[serde(default)]
     pub empty_dirs: EmptyDirMode,
+    /// Default maximum size, in bytes, of a file synced in either direction;
+    /// larger files are skipped. Accepts a byte count or a size string like
+    /// `"100MB"`/`"512KiB"`. `0` means unlimited. Overridable per remote/sync.
+    #[serde(
+        default = "default_max_file_size",
+        deserialize_with = "de::byte_size",
+        serialize_with = "se::byte_size"
+    )]
+    pub max_file_size: u64,
     /// Globs excluded from every sync (in addition to each sync's own `exclude`
     /// and the always-forced conflict-copy glob). Defaults to well-known cruft
     /// like `.git`; set to `[]` to sync everything.
@@ -93,6 +105,7 @@ impl Default for DaemonConfig {
             interval: DEFAULT_INTERVAL,
             pull_interval: None,
             empty_dirs: EmptyDirMode::default(),
+            max_file_size: default_max_file_size(),
             exclude: default_exclude(),
             profile: default_profile(),
         }
@@ -128,10 +141,6 @@ pub struct Remote {
     /// (run via `sh -c` in the clone directory). Defaults to `"conflux sync"`.
     #[serde(default)]
     pub commit_msg_command: Option<String>,
-    /// Remote-level default pull scope (overridden per sync). See
-    /// [`Sync::pull_scope`].
-    #[serde(default)]
-    pub pull_scope: Option<PullScope>,
     /// Remote-level default for periodic remote pulls (overrides the daemon
     /// default; overridden per sync). See [`DaemonConfig::pull_interval`].
     #[serde(default, deserialize_with = "de::opt_duration")]
@@ -140,12 +149,22 @@ pub struct Remote {
     /// overridden per sync). Ignored for git remotes, which cannot store them.
     #[serde(default)]
     pub empty_dirs: Option<EmptyDirMode>,
+    /// Remote-level maximum synced file size in bytes (overrides the daemon
+    /// default; overridden per sync). `0` means unlimited. See
+    /// [`DaemonConfig::max_file_size`].
+    #[serde(default, deserialize_with = "de::opt_byte_size")]
+    pub max_file_size: Option<u64>,
 }
 
 /// A sync group: one local root mapped to a remote path.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sync {
+    /// Optional short id for this group, used to target it from the CLI
+    /// (`conflux sync <id>`). Must be unique across syncs when set. The
+    /// `remote:remote_path` label works as a target too.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Optional human-friendly label for UIs; not used by the daemon.
     #[serde(default)]
     pub label: Option<String>,
@@ -158,16 +177,15 @@ pub struct Sync {
     /// surrounding slashes on load.
     #[serde(default)]
     pub remote_path: String,
-    /// Sync direction: bidirectional (`sync`, default) or `pull` only.
-    #[serde(default)]
-    pub direction: Direction,
-    /// Glob paths (relative to `local`) eligible for push; empty means "all".
+    /// Glob paths (relative to `local`) selecting what this group syncs. An empty
+    /// list (the default) matches nothing; use `["**"]` to match everything. How
+    /// paths outside `include` are treated is governed by [`Sync::scope`].
     #[serde(default)]
     pub include: Vec<String>,
-    /// Whether pulls cover the whole remote tree or only `include`. Overrides
-    /// the remote-level default; falls back to `all` when unset everywhere.
+    /// What this group covers relative to `include`: `include` (default),
+    /// `remote`, `local`, or `mirror`. See [`Scope`]. Sync-level only.
     #[serde(default)]
-    pub pull_scope: Option<PullScope>,
+    pub scope: Scope,
     /// How this group is triggered.
     pub trigger: Trigger,
     /// Timer interval; defaults to one hour when `trigger = "timer"`.
@@ -186,6 +204,11 @@ pub struct Sync {
     /// default): `ignore` (default), `prune`, or `keep`. Ignored for git.
     #[serde(default)]
     pub empty_dirs: Option<EmptyDirMode>,
+    /// Maximum synced file size in bytes for this group (overrides the
+    /// remote/daemon default). `0` means unlimited. See
+    /// [`DaemonConfig::max_file_size`].
+    #[serde(default, deserialize_with = "de::opt_byte_size")]
+    pub max_file_size: Option<u64>,
     /// Profiles this group belongs to. When the setting is omitted it defaults
     /// to the implicit `["default"]`; an explicit list (even empty) is used
     /// verbatim, without any implicit `default` membership.
@@ -251,6 +274,7 @@ impl Config {
         }
 
         let mut labels = HashSet::new();
+        let mut sync_ids = HashSet::new();
         for sync in &self.syncs {
             if !ids.contains(sync.remote.as_str()) {
                 return Err(Error::Validation(format!(
@@ -266,6 +290,13 @@ impl Config {
                 return Err(Error::Validation(format!(
                     "duplicate sync group `{label}` (same remote and remote_path)"
                 )));
+            }
+            // `id` is used to target a single group from the CLI, so it must be
+            // unambiguous.
+            if let Some(id) = &sync.id {
+                if !sync_ids.insert(id.as_str()) {
+                    return Err(Error::Validation(format!("duplicate sync id `{id}`")));
+                }
             }
             // `watch-both` watches the remote's filesystem path, which only a
             // `local` backend has — reject it up front rather than silently
@@ -290,6 +321,26 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Non-fatal configuration lints: conditions that parse and validate fine
+    /// but are almost certainly mistakes. Returned as human-readable messages
+    /// for the caller to surface (the daemon logs them at startup; `conflux
+    /// config validate` prints them).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for sync in &self.syncs {
+            // `scope = "include"` with no `include` globs matches nothing, so the
+            // group is inert — likely an oversight rather than intent.
+            if sync.scope == Scope::Include && sync.include.is_empty() {
+                out.push(format!(
+                    "sync group `{}` has scope = \"include\" but an empty `include`, so it \
+                     syncs nothing; add `include` globs or pick a different `scope`",
+                    crate::engine::group_label(sync)
+                ));
+            }
+        }
+        out
     }
 
     /// Look up a remote by its id.
@@ -344,11 +395,6 @@ impl Sync {
         }
         out
     }
-
-    /// Whether `include` selects everything under `local`.
-    pub fn includes_all(&self) -> bool {
-        self.include.is_empty()
-    }
 }
 
 fn default_log_level() -> String {
@@ -365,6 +411,54 @@ fn default_debounce() -> Duration {
 
 fn default_interval() -> Duration {
     DEFAULT_INTERVAL
+}
+
+fn default_max_file_size() -> u64 {
+    DEFAULT_MAX_FILE_SIZE
+}
+
+/// Parse a byte size: a bare number (bytes) or a number with a unit suffix.
+/// Decimal units (`KB`, `MB`, `GB`, `TB`) are powers of 1000; binary units
+/// (`KiB`, `MiB`, `GiB`, `TiB`) are powers of 1024. Case-insensitive.
+fn parse_byte_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size".to_string());
+    }
+    // Split the leading numeric part from an optional unit suffix.
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num
+        .parse()
+        .map_err(|_| format!("invalid size number in `{s}`"))?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1e3,
+        "m" | "mb" => 1e6,
+        "g" | "gb" => 1e9,
+        "t" | "tb" => 1e12,
+        "kib" => 1024.0,
+        "mib" => 1024f64.powi(2),
+        "gib" => 1024f64.powi(3),
+        "tib" => 1024f64.powi(4),
+        other => return Err(format!("unknown size unit `{other}` in `{s}`")),
+    };
+    Ok((value * mult) as u64)
+}
+
+/// Format a byte count back to a compact decimal size string for `config show`,
+/// preferring the largest unit that divides it evenly (e.g. `100000000` →
+/// `"100MB"`); falls back to a bare byte count (which also covers `0`).
+fn format_byte_size(n: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[("TB", 1_000_000_000_000), ("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)];
+    for (name, factor) in UNITS {
+        if n >= *factor && n % factor == 0 {
+            return format!("{}{name}", n / factor);
+        }
+    }
+    n.to_string()
 }
 
 /// Active profile when the `[daemon] profile` setting is omitted.
@@ -411,6 +505,40 @@ mod de {
             None => Ok(None),
         }
     }
+
+    /// A byte size given either as an integer (bytes) or a size string.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ByteSize {
+        Int(u64),
+        Str(String),
+    }
+
+    impl ByteSize {
+        fn into_bytes<E: serde::de::Error>(self) -> Result<u64, E> {
+            match self {
+                ByteSize::Int(n) => Ok(n),
+                ByteSize::Str(s) => super::parse_byte_size(&s).map_err(E::custom),
+            }
+        }
+    }
+
+    pub fn byte_size<'de, D>(d: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        ByteSize::deserialize(d)?.into_bytes()
+    }
+
+    pub fn opt_byte_size<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Option::<ByteSize>::deserialize(d)? {
+            Some(bs) => bs.into_bytes().map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 mod se {
@@ -422,6 +550,13 @@ mod se {
         S: Serializer,
     {
         s.serialize_str(&humantime::format_duration(*d).to_string())
+    }
+
+    pub fn byte_size<S>(n: &u64, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        s.serialize_str(&super::format_byte_size(*n))
     }
 }
 
@@ -459,9 +594,8 @@ mod tests {
         let sync = &cfg.syncs[0];
         assert_eq!(sync.trigger, Trigger::Watch);
         assert_eq!(sync.debounce, Some(Duration::from_secs(3)));
-        assert_eq!(sync.pull_scope, None); // unset => inherits, resolving to `all`
-        assert_eq!(sync.direction, Direction::Sync);
-        assert!(!sync.includes_all());
+        assert_eq!(sync.scope, Scope::Include); // unset => the safe default
+        assert_eq!(sync.include, vec!["nvim".to_string(), "fish/*".to_string()]);
     }
 
     #[test]
@@ -479,13 +613,51 @@ mod tests {
         assert_eq!(d.debounce, DEFAULT_DEBOUNCE);
         assert_eq!(d.interval, DEFAULT_INTERVAL);
         assert_eq!(d.empty_dirs, EmptyDirMode::Ignore);
+        assert_eq!(d.max_file_size, DEFAULT_MAX_FILE_SIZE);
         assert_eq!(d.profile.as_deref(), Some("default"));
         // pull_interval is shown as "0s" (the representable "disabled" default).
         assert!(d.pull_interval.is_none_or(|dur| dur.is_zero()));
     }
 
     #[test]
-    fn parses_pull_direction() {
+    fn parses_max_file_size_as_bytes_units_and_zero() {
+        // Size strings and bare byte counts both parse; `0` means unlimited.
+        assert_eq!(parse_byte_size("100MB"), Ok(100_000_000));
+        assert_eq!(parse_byte_size("512KiB"), Ok(512 * 1024));
+        assert_eq!(parse_byte_size("2gb"), Ok(2_000_000_000));
+        assert_eq!(parse_byte_size("1048576"), Ok(1_048_576));
+        assert!(parse_byte_size("10QB").is_err());
+        // Round-trips through the serializer for `config show`.
+        assert_eq!(format_byte_size(100_000_000), "100MB");
+        assert_eq!(format_byte_size(0), "0");
+
+        let cfg = Config::from_toml_str(
+            r#"
+            [daemon]
+            max_file_size = "250MB"
+
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/mirror"
+            max_file_size = 0
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/cfg"
+            remote_path = "x"
+            trigger = "timer"
+            max_file_size = "10MiB"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.daemon.max_file_size, 250_000_000);
+        assert_eq!(cfg.remotes[0].max_file_size, Some(0));
+        assert_eq!(cfg.syncs[0].max_file_size, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parses_scope() {
         let cfg = Config::from_toml_str(
             r#"
             [[remote]]
@@ -498,11 +670,68 @@ mod tests {
             local = "/tmp/cfg"
             remote_path = "x"
             trigger = "timer"
-            direction = "pull"
+            scope = "remote"
         "#,
         )
         .unwrap();
-        assert_eq!(cfg.syncs[0].direction, Direction::Pull);
+        assert_eq!(cfg.syncs[0].scope, Scope::Remote);
+    }
+
+    #[test]
+    fn parses_optional_sync_id_and_rejects_duplicates() {
+        let base = r#"
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            id = "docs"
+            remote = "r"
+            local = "/tmp/a"
+            remote_path = "documents"
+            trigger = "manual"
+        "#;
+        let cfg = Config::from_toml_str(base).unwrap();
+        assert_eq!(cfg.syncs[0].id.as_deref(), Some("docs"));
+
+        // A second group reusing the same id is rejected.
+        let err = Config::from_toml_str(&format!(
+            "{base}\n[[sync]]\nid = \"docs\"\nremote = \"r\"\nlocal = \"/tmp/b\"\n\
+             remote_path = \"other\"\ntrigger = \"manual\"\n"
+        ))
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn warns_when_include_scope_has_empty_include() {
+        let base = r#"
+            [[remote]]
+            id = "r"
+            backend = "local"
+            url = "/tmp/mirror"
+
+            [[sync]]
+            remote = "r"
+            local = "/tmp/cfg"
+            remote_path = "x"
+            trigger = "manual"
+        "#;
+
+        // Default scope = "include" with no `include` globs: inert, so warn.
+        let cfg = Config::from_toml_str(base).unwrap();
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("syncs nothing"));
+
+        // Giving it an `include` clears the warning.
+        let cfg = Config::from_toml_str(&format!("{base}\ninclude = [\"nvim\"]")).unwrap();
+        assert!(cfg.warnings().is_empty());
+
+        // So does a scope that reaches beyond `include`.
+        let cfg = Config::from_toml_str(&format!("{base}\nscope = \"mirror\"")).unwrap();
+        assert!(cfg.warnings().is_empty());
     }
 
     #[test]
@@ -530,7 +759,10 @@ mod tests {
         assert_eq!(cfg.daemon.exclude, default_exclude());
         assert!(cfg.daemon.exclude.iter().any(|e| e == "**/.git/**"));
         let sync = &cfg.syncs[0];
-        assert!(sync.includes_all());
+        // Unset `scope`/`include` => the safe default: `include` scope, empty
+        // include list (nothing synced until the user opts paths in).
+        assert_eq!(sync.scope, Scope::Include);
+        assert!(sync.include.is_empty());
         // No per-sync interval => falls back to the daemon default.
         assert_eq!(sync.interval, None);
         assert_eq!(sync.effective_interval(cfg.daemon.interval), DEFAULT_INTERVAL);
@@ -547,18 +779,19 @@ mod tests {
         // conflict glob show up.
         let defaults = vec!["**/.git/**".to_string()];
         let sync = Sync {
+            id: None,
             label: None,
             remote: "r".into(),
             local: "/tmp/x".into(),
             remote_path: String::new(),
-            direction: Direction::Sync,
             include: vec![],
-            pull_scope: None,
+            scope: Scope::default(),
             trigger: Trigger::Manual,
             interval: None,
             debounce: None,
             pull_interval: None,
             empty_dirs: None,
+            max_file_size: None,
             profiles: default_profiles(),
             exclude: vec!["*.log".to_string()],
         };

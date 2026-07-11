@@ -65,17 +65,6 @@ pub enum Trigger {
     WatchBoth,
 }
 
-/// Direction of synchronization for a sync group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Direction {
-    /// Bidirectional sync with newer-wins conflict resolution (default).
-    #[default]
-    Sync,
-    /// Pull-only: download remote changes; never upload local ones.
-    Pull,
-}
-
 /// How empty directories are handled during a sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,13 +79,28 @@ pub enum EmptyDirMode {
     Mirror,
 }
 
-/// How much of the remote tree a sync pulls down.
+/// What a sync group covers, relative to its `include` globs. `exclude` always
+/// applies on top, in every variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum PullScope {
-    /// Pull every file under the remote path (default).
+pub enum Scope {
+    /// Sync only the paths matched by `include`, bidirectionally (creates,
+    /// modifications, and deletions). Anything outside `include` is ignored
+    /// entirely — never pushed, pulled, or deleted (default).
     #[default]
-    All,
-    /// Pull only the paths listed in `include`.
     Include,
+    /// Like `include`, but additionally pull every other remote file down. Those
+    /// non-included files are pull-only: the remote overrides local (a conflict
+    /// copy is still kept locally when the local copy diverged), so listing them
+    /// in `include` is what promotes them to a two-way sync. Good for dotfiles
+    /// you want mirrored read-only unless opted into full sync.
+    Remote,
+    /// The reverse of `remote`: like `include`, but additionally push every other
+    /// local file up. Those non-included files are push-only: local overrides the
+    /// remote (a conflict copy of the losing remote version is still kept
+    /// locally).
+    Local,
+    /// Sync the whole tree 1:1 in both directions, including deletions, ignoring
+    /// `include`. This can delete files en masse on either side, so use with care.
+    Mirror,
 }

@@ -28,8 +28,8 @@ struct Cli {
 
     /// Instance profile, defaulting to "default". Selects which daemon this
     /// command targets: it namespaces the state dir and control socket, and the
-    /// daemon runs only this profile's syncs. Systemd wires it to the template
-    /// instance (`conflux@<profile>`), so one shared config drives many hosts.
+    /// daemon runs only this profile's syncs, so one shared config can drive
+    /// many hosts.
     #[arg(long, short, global = true, value_name = "NAME")]
     profile: Option<String>,
 
@@ -39,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the sync daemon (invoked by systemd).
+    /// Run the sync daemon in the foreground.
     Daemon,
     /// Inspect or validate configuration.
     Config {
@@ -50,7 +50,8 @@ enum Command {
     Status,
     /// Trigger a sync now on the targeted profile's daemon.
     Sync {
-        /// Sync group to run; omit to run every group of this profile.
+        /// Sync to run, by its `id` or `remote:remote_path` label; omit to run
+        /// every group of this profile.
         group: Option<String>,
     },
     /// Reload the daemon configuration.
@@ -122,9 +123,8 @@ fn run(cli: &Cli, log_reload: &LogReload) -> anyhow::Result<ExitCode> {
                     let _ = log_reload.modify(|f| *f = filter);
                 }
             }
-            // An explicit `--profile` (e.g. from `conflux@<profile>.service`)
-            // overrides the config default so one shared config file can drive
-            // different profiles on different hosts.
+            // An explicit `--profile` overrides the config default so one shared
+            // config file can drive different profiles on different hosts.
             if let Some(profile) = &cli.profile {
                 config.daemon.profile = Some(profile.clone());
             }
@@ -173,6 +173,9 @@ fn run_config(action: &ConfigCmd, paths: &Paths) -> anyhow::Result<()> {
                 cfg.remotes.len(),
                 cfg.syncs.len()
             );
+            for lint in cfg.warnings() {
+                println!("warning: {lint}");
+            }
             Ok(())
         }
         ConfigCmd::Show => {

@@ -1,4 +1,4 @@
-//! Glob matching for `include` (push scope) and `exclude` patterns.
+//! Glob matching for `include` (what a group syncs) and `exclude` patterns.
 //!
 //! Patterns are matched with `*` bound to a single path segment and `**`
 //! spanning across separators (standard gitignore-style semantics):
@@ -25,9 +25,9 @@ pub struct Matcher {
 }
 
 impl Matcher {
-    /// Build a matcher. When `patterns` is empty, `is_match` returns `empty_default`
-    /// (used so that an empty `include` means "everything" but an empty `exclude`
-    /// means "nothing").
+    /// Build a matcher. When `patterns` is empty, `is_match` returns `empty_default`:
+    /// callers pass `false` to match nothing on an empty list (as `include` and
+    /// `exclude` both do) or `true` to match everything.
     pub fn new(patterns: &[String], empty_default: bool) -> Result<Self> {
         let mut builder = GlobSetBuilder::new();
         for pattern in patterns {

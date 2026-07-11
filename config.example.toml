@@ -39,6 +39,12 @@
 # Ignored for git remotes, which cannot store empty directories.
 # empty_dirs = "ignore"
 
+# Largest file that will be synced in EITHER direction; anything bigger is
+# skipped (logged at debug level). Accepts a byte count or a size string with a
+# decimal (KB/MB/GB/TB, ×1000) or binary (KiB/MiB/GiB, ×1024) unit. "0" (or
+# unset) means unlimited. Overridable per remote and per sync. (default: 100MB)
+# max_file_size = "100MB"
+
 # Globs excluded from every sync, added to each sync's own `exclude` (and the
 # always-forced conflict-copy glob). Defaults to well-known VCS/OS cruft; set to
 # [] to sync everything.
@@ -46,8 +52,7 @@
 
 # Which profile this host runs: only syncs whose `profiles` include this value
 # are active. "default" matches syncs that omit `profiles`. Usually left at
-# "default" and selected per-host via systemd (`conflux@desktop` runs the
-# "desktop" profile); `conflux --profile <name> daemon` overrides it and gives
+# "default"; `conflux --profile <name> daemon` overrides it per host and gives
 # each profile its own state dir + socket so instances can run in parallel.
 # profile = "default"
 
@@ -78,8 +83,7 @@
 # password = "secret"
 # password_command = "secret-tool lookup service conflux"   # from a keyring
 # password_command = 'printf %s "$CONFLUX_PASSWORD"'         # from an env var
-# # (For env vars under systemd, set them in the unit via Environment= or
-# #  EnvironmentFile=; a manually-run daemon inherits your shell environment.)
+# # (The daemon inherits the environment of the process that started it.)
 #
 # # Git only (optional): branch to track; defaults to the remote's default branch.
 # branch = "main"
@@ -91,15 +95,20 @@
 # commit_msg_command = "git diff --cached --shortstat"
 #
 # # Remote-level defaults inherited by this remote's syncs (each optional; a
-# # per-sync value overrides these).
-# pull_scope = "all"           # "all" (default) | "include"
+# # per-sync value overrides these). Note: `scope` is sync-level only.
 # pull_interval = "10m"        # overrides the [daemon] default
 # empty_dirs = "mirror"        # overrides the [daemon] default
+# max_file_size = "250MB"      # overrides the [daemon] default ("0" = unlimited)
 
 # ===========================================================================
 # [[sync]] — a sync group: one local directory mapped to a path on a remote.
 # ===========================================================================
 # [[sync]]
+#
+# # Short id used to target this group from the CLI, e.g. `conflux sync dotfiles`
+# # (the `remote:remote_path` label works as a target too). Must be unique across
+# # syncs. (optional)
+# id = "dotfiles"
 #
 # # Human-friendly label shown in UIs; purely descriptive. (optional)
 # label = "Config files"
@@ -114,22 +123,36 @@
 # # root. Surrounding slashes are trimmed. (default: "")
 # remote_path = "config"
 #
-# # Sync direction: "sync" (bidirectional, newer-wins) or "pull" (download only;
-# # local changes are never uploaded). (default: "sync")
-# direction = "sync"
-#
-# # Push scope: globs (relative to `local`) selecting what may be pushed; empty
-# # means everything. `*` matches one path segment, `**` matches across
-# # segments, and a plain name includes its whole subtree. (default: [] = all)
+# # Globs (relative to `local`) selecting what this group syncs. `*` matches one
+# # path segment, `**` matches across segments, and a plain name includes its
+# # whole subtree. An EMPTY list (the default) matches NOTHING — nothing is
+# # synced until you opt paths in; use ["**"] to select everything. How paths
+# # OUTSIDE this list are treated is governed by `scope` below. (default: [])
 # include = ["nvim", "fish/*", "**/*.conf"]
 #
 # # Globs (relative to `local`) never synced in either direction. ADDED to the
-# # [daemon] `exclude` defaults, not replacing them. (default: [])
+# # [daemon] `exclude` defaults, not replacing them. Applied in every `scope`.
+# # (default: [])
 # exclude = ["*.log", "cache/**"]
 #
-# # What pulls cover: "all" (the whole remote tree) or "include" (only the
-# # `include` globs). (default: inherits remote → "all")
-# pull_scope = "all"
+# # What this group covers, relative to `include`. Sync-level only. Paths matched
+# # by `include` always sync both ways (creates, edits, deletes); `scope` decides
+# # what happens to everything else:
+# #   "include" — (default) ignore everything outside `include` entirely: it is
+# #               never pushed, pulled, or deleted. The safe default — pointing a
+# #               remote at your $HOME can't wipe untracked files.
+# #   "remote"  — additionally PULL every other remote file down, read-only: the
+# #               remote overrides local (a conflict copy is still kept locally if
+# #               the local copy diverged). List a path in `include` to promote it
+# #               to a full two-way sync. Good for dotfiles.
+# #   "local"   — the reverse of "remote": additionally PUSH every other local
+# #               file up; local overrides the remote (losing remote version kept
+# #               as a local conflict copy).
+# #   "mirror"  — sync the whole tree 1:1 both ways, including deletions, IGNORING
+# #               `include`. WARNING: this can delete files en masse on either
+# #               side (e.g. an empty/stale remote will wipe your local tree, and
+# #               vice versa). Use only for a dedicated mirror, never against $HOME.
+# scope = "include"
 #
 # # How this group is triggered: "manual" (only `conflux sync`), "timer"
 # # (every `interval`), "watch" (on local file changes, debounced), or
@@ -150,6 +173,10 @@
 # # Empty-directory handling: "ignore" | "prune" | "mirror". Ignored for git.
 # # (default: inherits remote → [daemon] empty_dirs)
 # empty_dirs = "mirror"
+#
+# # Largest file synced in either direction; bigger files are skipped. "0" =
+# # unlimited. (default: inherits remote → [daemon] max_file_size = 100MB)
+# max_file_size = "500MB"
 #
 # # Profiles this group belongs to. Omit for the implicit ["default"]; an
 # # explicit list (even []) is used verbatim, with no implicit "default".
@@ -187,7 +214,9 @@
 # --- Syncs ------------------------------------------------------------------
 
 # Live two-way sync of selected ~/.config subtrees to Nextcloud, reacting to
-# local edits and polling the remote every few minutes for changes made elsewhere.
+# local edits and polling the remote every few minutes for changes made
+# elsewhere. Only the `include` paths sync (default scope = "include"); anything
+# else under ~/.config is left completely alone.
 # [[sync]]
 # remote = "nextcloud"
 # local  = "~/.config"
@@ -196,28 +225,37 @@
 # trigger = "watch"
 # pull_interval = "5m"
 
-# Dotfiles repo synced on a timer; empty directories kept on both sides.
-# (empty_dirs is ignored here anyway because the remote is git.)
+# Dotfiles into $HOME with scope = "remote": every tracked file is pulled down
+# read-only, so pointing a shared dotfiles remote at your home directory can
+# never delete or overwrite the files you did NOT put in the repo. The handful
+# of dotfiles you want edited on this host AND pushed back are listed in
+# `include`, promoting just those to a full two-way sync.
 # [[sync]]
 # remote = "dotfiles"
-# local  = "~/.dotfiles"
+# local  = "~"
+# scope = "remote"
+# include = [".bashrc", ".config/nvim"]
 # trigger = "timer"
 # interval = "15m"
 
-# Pull-only mirror: download from the remote, never upload local changes.
+# Read-only pull: download the whole remote tree and never upload. With an empty
+# `include`, scope = "remote" pushes nothing, so local changes stay local and any
+# extra local-only files are left untouched.
 # [[sync]]
 # remote = "nextcloud"
 # local  = "~/Documents/shared"
 # remote_path = "shared"
-# direction = "pull"
+# scope = "remote"
 # trigger = "timer"
 
-# Full backup of ~/Documents to a local disk, pruning empty directories,
-# active only on the "desktop" profile.
+# Full backup of a dedicated ~/Documents tree to a local disk, mirrored 1:1
+# (scope = "mirror" — deletions propagate both ways, so only point it at a
+# directory you truly want kept identical), active only on the "desktop" profile.
 # [[sync]]
 # remote = "backup"
 # local  = "~/Documents"
 # remote_path = "documents"
+# scope = "mirror"
 # trigger = "watch"
 # empty_dirs = "prune"
 # profiles = ["desktop"]

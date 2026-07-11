@@ -11,12 +11,13 @@ use crate::error::Result;
 use crate::hash::hash_bytes;
 use crate::index::Index;
 use crate::matcher::Matcher;
-use crate::model::{Direction, EmptyDirMode, FileMeta, PullScope};
+use crate::model::{EmptyDirMode, FileMeta, Scope};
 use crate::relpath::RelPath;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::debug;
 
 /// Which side won a conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,23 +131,20 @@ pub fn run(
     state_dir: &Path,
     remote_refresh: bool,
     empty_dirs: EmptyDirMode,
+    max_file_size: u64,
     exclude_defaults: &[String],
 ) -> Result<SyncReport> {
     let backend = crate::backend::build(remote, sync, state_dir)?;
     let index_path = Index::path_for(state_dir, sync);
     let mut index = Index::load(&index_path)?;
-    // pull_scope resolves per-sync, then per-remote, then the `all` default.
-    let pull_scope = sync
-        .pull_scope
-        .or(remote.pull_scope)
-        .unwrap_or_default();
     let report = sync_group(
         sync,
         backend.as_ref(),
         &mut index,
         remote_refresh,
         empty_dirs,
-        pull_scope,
+        sync.scope,
+        max_file_size,
         exclude_defaults,
     )?;
     index.save(&index_path)?;
@@ -185,23 +183,91 @@ enum Action {
     ResurrectPull,
     /// Pull-only path whose local copy diverged: overwrite, preserving local.
     PullPreserveLocal,
+    /// Push-only path whose remote copy diverged: overwrite, preserving the
+    /// remote version as a local conflict copy.
+    PushPreserveRemote,
+}
+
+/// How a single path is synced, derived from the group's [`Scope`] and the
+/// path's `include` membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMode {
+    /// Ignore the path entirely (never push, pull, or delete).
+    Skip,
+    /// Reconcile both sides (creates, edits, deletes, conflicts).
+    Bidir,
+    /// Only bring remote changes down; local edits never reach the remote.
+    PullOnly,
+    /// Only push local changes up; remote edits never reach local.
+    PushOnly,
+}
+
+/// Resolve how one path is synced from the group's scope and the path's
+/// `include` membership. `mirror` ignores `include` (everything is
+/// bidirectional); the other scopes make included paths bidirectional and treat
+/// the rest per scope: `include` skips them, `remote` pulls them, `local`
+/// pushes them.
+fn key_mode(scope: Scope, included: bool) -> KeyMode {
+    match scope {
+        Scope::Mirror => KeyMode::Bidir,
+        _ if included => KeyMode::Bidir,
+        Scope::Include => KeyMode::Skip,
+        Scope::Remote => KeyMode::PullOnly,
+        Scope::Local => KeyMode::PushOnly,
+    }
+}
+
+/// If `action` would transfer a file whose size exceeds `limit`, return that
+/// size (so the caller can skip and log it). `limit == 0` means no cap. Actions
+/// that move no bytes (deletes, index-only, nothing) are never capped. A
+/// conflict transfers both ways, so the larger side is checked.
+fn oversize(
+    action: Action,
+    local: &BTreeMap<RelPath, FileMeta>,
+    remote: &crate::backend::RemoteSnapshot,
+    key: &RelPath,
+    limit: u64,
+) -> Option<u64> {
+    if limit == 0 {
+        return None;
+    }
+    let size = match action {
+        Action::Push | Action::ResurrectPush | Action::PushPreserveRemote => {
+            local.get(key).map(|m| m.size)?
+        }
+        Action::Pull | Action::ResurrectPull | Action::PullPreserveLocal => {
+            remote.get(key).map(|m| m.size)?
+        }
+        Action::Conflict => {
+            let l = local.get(key).map_or(0, |m| m.size);
+            let r = remote.get(key).map_or(0, |m| m.size);
+            l.max(r)
+        }
+        Action::Nothing | Action::DropIndex | Action::DeleteLocal | Action::DeleteRemote => {
+            return None
+        }
+    };
+    (size > limit).then_some(size)
 }
 
 /// Reconcile and apply one sync group against `backend`, updating `index`.
 ///
 /// When `remote_refresh` is set (a periodic `pull_interval` poll), bidirectional
 /// files only follow remote-originated changes; see [`decide_remote_refresh`].
+#[allow(clippy::too_many_arguments)]
 pub fn sync_group(
     sync: &Sync,
     backend: &dyn Backend,
     index: &mut Index,
     remote_refresh: bool,
     empty_dirs: EmptyDirMode,
-    pull_scope: PullScope,
+    scope: Scope,
+    max_file_size: u64,
     exclude_defaults: &[String],
 ) -> Result<SyncReport> {
     let exclude = Matcher::new(&sync.effective_excludes(exclude_defaults), false)?;
-    let include = Matcher::new(&sync.include, true)?;
+    // Empty `include` matches nothing; `["**"]` matches everything.
+    let include = Matcher::new(&sync.include, false)?;
 
     let local = scan_local(&sync.local, &exclude)?;
     let mut remote = backend.snapshot()?;
@@ -210,11 +276,10 @@ pub fn sync_group(
     let mut report = SyncReport::default();
 
     for key in union_keys(&local, &remote, index) {
-        let included = include.is_match(&key);
-        if pull_scope == PullScope::Include && !included {
+        let mode = key_mode(scope, include.is_match(&key));
+        if mode == KeyMode::Skip {
             continue;
         }
-        let pull_only = sync.direction == Direction::Pull || !included;
 
         let base = index.get(&key).cloned();
         let local_change = classify(
@@ -226,15 +291,36 @@ pub fn sync_group(
             base.as_ref().map(|b| b.remote_id.as_str()),
         );
 
-        let action = if remote_refresh && !pull_only {
+        let action = match mode {
             // Bidirectional file during a background pull: apply only remote-side
             // changes; leave local edits/deletes to the bidirectional trigger.
-            decide_remote_refresh(local_change, remote_change)
-        } else if pull_only {
-            decide_pull_only(local_change, remote_change, local.contains_key(&key))
-        } else {
-            decide_bidir(local_change, remote_change)
+            KeyMode::Bidir if remote_refresh => decide_remote_refresh(local_change, remote_change),
+            KeyMode::Bidir => decide_bidir(local_change, remote_change),
+            KeyMode::PullOnly => {
+                decide_pull_only(local_change, remote_change, local.contains_key(&key))
+            }
+            // A background remote poll never pushes, so a push-only file is left
+            // for its normal (local-driven) trigger.
+            KeyMode::PushOnly if remote_refresh => Action::Nothing,
+            KeyMode::PushOnly => {
+                decide_push_only(local_change, remote_change, remote.contains_key(&key))
+            }
+            KeyMode::Skip => unreachable!("skipped above"),
         };
+
+        // Skip files whose transfer would exceed the configured size cap, in
+        // either direction. The index is left untouched, so the file simply
+        // stays unsynced until it shrinks or the cap is raised.
+        if let Some(size) = oversize(action, &local, &remote, &key, max_file_size) {
+            debug!(
+                group = %group_label(sync),
+                path = %key,
+                size,
+                limit = max_file_size,
+                "skipping file larger than max_file_size"
+            );
+            continue;
+        }
 
         apply(
             sync,
@@ -475,6 +561,31 @@ fn apply(
                 report.record_write(key, had_baseline);
             }
         }
+
+        Action::PushPreserveRemote => {
+            let local_meta = local.get(key).expect("push requires a local file");
+            let local_data = std::fs::read(key.to_local(root))?;
+            let mut conflicted = false;
+            // If the remote diverged, preserve its version as a local conflict
+            // copy before overwriting the remote with the local content.
+            if remote.get(key).is_some() {
+                let remote_data = backend.read(key)?;
+                if hash_bytes(&remote_data) != local_meta.hash {
+                    let copy = write_conflict_copy(root, key, &remote_data)?;
+                    report.conflicts.push(ConflictRecord {
+                        path: key.clone(),
+                        winner: Winner::Local,
+                        conflict_copy: copy,
+                    });
+                    conflicted = true;
+                }
+            }
+            let written = backend.write(key, &local_data, Some(local_meta.mtime))?;
+            index.set(key, local_meta.hash.clone(), written.id);
+            if !conflicted {
+                report.record_write(key, had_baseline);
+            }
+        }
     }
     Ok(())
 }
@@ -562,6 +673,38 @@ fn decide_pull_only(local: Change, remote: Change, local_present: bool) -> Actio
         Same => {
             if local == Removed {
                 Action::Pull
+            } else {
+                Action::Nothing
+            }
+        }
+        Gone => Action::Nothing,
+    }
+}
+
+/// The mirror of [`decide_pull_only`] for a push-only path (`scope = "local"`):
+/// local changes flow up, remote changes never come down. Keyed on the local
+/// change, with the remote in the passenger seat.
+fn decide_push_only(local: Change, remote: Change, remote_present: bool) -> Action {
+    use Change::*;
+    match local {
+        Modified | Created => {
+            if remote_present && matches!(remote, Modified | Created) {
+                Action::PushPreserveRemote
+            } else {
+                Action::Push
+            }
+        }
+        Removed => {
+            if remote == Same {
+                Action::DeleteRemote
+            } else {
+                Action::Nothing
+            }
+        }
+        // Local unchanged: restore a tracked file deleted on the remote, else leave it.
+        Same => {
+            if remote == Removed {
+                Action::Push
             } else {
                 Action::Nothing
             }
@@ -691,5 +834,52 @@ mod tests {
         // Unchanged behavior for genuinely pull-only groups: local is a mirror,
         // so a deleted file is restored from the remote on the next pull.
         assert_eq!(decide_pull_only(Removed, Same, false), Action::Pull);
+    }
+
+    #[test]
+    fn push_only_mirrors_pull_only_with_the_sides_swapped() {
+        // Local changes flow up; remote changes never come down.
+        assert_eq!(decide_push_only(Created, Gone, false), Action::Push);
+        assert_eq!(decide_push_only(Modified, Same, true), Action::Push);
+        // Both sides diverged: local wins, remote kept as a local conflict copy.
+        assert_eq!(
+            decide_push_only(Modified, Modified, true),
+            Action::PushPreserveRemote
+        );
+        // A tracked file deleted on the remote is restored by re-pushing.
+        assert_eq!(decide_push_only(Same, Removed, false), Action::Push);
+        // A local delete propagates to the remote.
+        assert_eq!(decide_push_only(Removed, Same, true), Action::DeleteRemote);
+        // Remote-only changes are ignored.
+        assert_eq!(decide_push_only(Same, Modified, true), Action::Nothing);
+    }
+
+    #[test]
+    fn key_mode_include_scope_skips_non_included_paths() {
+        use Scope::*;
+        // Included paths sync both ways; the rest are ignored entirely.
+        assert_eq!(key_mode(Include, true), KeyMode::Bidir);
+        assert_eq!(key_mode(Include, false), KeyMode::Skip);
+    }
+
+    #[test]
+    fn key_mode_remote_scope_pulls_non_included_paths() {
+        use Scope::*;
+        assert_eq!(key_mode(Remote, true), KeyMode::Bidir);
+        assert_eq!(key_mode(Remote, false), KeyMode::PullOnly);
+    }
+
+    #[test]
+    fn key_mode_local_scope_pushes_non_included_paths() {
+        use Scope::*;
+        assert_eq!(key_mode(Local, true), KeyMode::Bidir);
+        assert_eq!(key_mode(Local, false), KeyMode::PushOnly);
+    }
+
+    #[test]
+    fn key_mode_mirror_scope_ignores_include() {
+        use Scope::*;
+        assert_eq!(key_mode(Mirror, false), KeyMode::Bidir);
+        assert_eq!(key_mode(Mirror, true), KeyMode::Bidir);
     }
 }

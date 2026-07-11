@@ -26,7 +26,7 @@ pub enum Request {
 pub enum SyncTarget {
     /// Every active group.
     All,
-    /// A single group by its label (`remote:remote_path`).
+    /// A single group, selected by its `id` or its `remote:remote_path` label.
     Group(String),
 }
 

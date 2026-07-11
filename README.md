@@ -45,7 +45,7 @@ password = "secret"            # or: password_command = "secret-tool lookup ..."
 remote      = "nextcloud"
 local       = "~/.config"      # one local root
 remote_path = "config"
-include     = ["nvim", "fish"] # only these are pushed (default: everything)
+include     = ["nvim", "fish"] # only these paths sync (default: [] = nothing)
 trigger     = "watch"          # manual | timer | watch
 ```
 
@@ -80,7 +80,8 @@ instance, e.g. `conflux --profile desktop status`):
 ```sh
 conflux status                 # per-group last-run summary
 conflux sync                   # sync every group this daemon runs
-conflux sync nextcloud:config  # sync one group (label is remote:remote_path)
+conflux sync nextcloud:config  # sync one group by its remote:remote_path label
+conflux sync dotfiles          # ...or by its `id`, if the [[sync]] sets one
 conflux reload                 # re-read the config file (also: systemctl reload / SIGHUP)
 ```
 
@@ -91,22 +92,46 @@ Each profile is a separate daemon with its own state dir and socket, so several
 
 - **Sync group** — one `local` root mapped to a remote's `remote_path` (optional;
   omit it to map the remote's root). Its label is `remote:remote_path`, or just
-  `remote` when the path is the root.
-- **`include` (push scope)** — globs (relative to `local`) selecting what is
-  *pushed*, where `*` matches one path segment and `**` matches across segments
-  (a plain name includes its whole subtree). Empty means everything. Pull always
-  downloads the whole remote tree unless `pull_scope = "include"`.
-- **`exclude`** — globs never synced in either direction. A sync's `exclude` is
-  *added to* the `[daemon] exclude` list, which defaults to well-known cruft
-  (`.git`, `.svn`, `.hg`, `.DS_Store`, `Thumbs.db`, `*.swp`); set `[daemon]
-  exclude = []` to sync everything. Conflict copies are always excluded.
-- **`direction`** — `sync` (bidirectional, default) or `pull` (download only;
-  local changes are never uploaded).
+  `remote` when the path is the root. Optionally give it a short unique `id` to
+  target it as `conflux sync <id>`.
+- **`include`** — globs (relative to `local`) selecting what the group syncs,
+  where `*` matches one path segment and `**` matches across segments (a plain
+  name includes its whole subtree). An **empty list (the default) matches
+  nothing** — nothing syncs until you opt paths in; use `["**"]` to select
+  everything. What happens to paths *outside* `include` is decided by `scope`.
+- **`scope`** (sync-level only) — how the group treats paths not matched by
+  `include` (matched paths always sync both ways):
+  - `include` *(default)* — ignore everything outside `include`; it is never
+    pushed, pulled, or deleted. The safe default: aiming a remote at your `$HOME`
+    can't touch untracked files.
+  - `remote` — additionally **pull** every other remote file down read-only (the
+    remote overrides local; a diverging local copy is kept as a conflict copy).
+    List a path in `include` to promote it to a full two-way sync. Good for
+    dotfiles.
+  - `local` — the reverse of `remote`: additionally **push** every other local
+    file up (local overrides the remote; the losing remote version is kept as a
+    local conflict copy).
+  - `mirror` — sync the whole tree 1:1 both ways, including deletions, **ignoring
+    `include`**. ⚠️ This can delete files en masse on either side — use only for a
+    dedicated mirror directory, never against `$HOME`.
+- **`exclude`** — globs never synced in either direction, applied in *every*
+  scope. A sync's `exclude` is *added to* the `[daemon] exclude` list, which
+  defaults to well-known cruft (`.git`, `.svn`, `.hg`, `.DS_Store`, `Thumbs.db`,
+  `*.swp`); set `[daemon] exclude = []` to drop those defaults. Conflict copies
+  are always excluded.
+
+  For a read-only mirror (download the remote, never upload), use `scope =
+  "remote"` with an empty `include`; for the reverse, `scope = "local"`.
 - **`empty_dirs`** — how empty directories are handled (resolved per-sync →
   per-remote → `[daemon]`): `ignore` (default, files only), `prune` (remove
   empty dirs from both sides), or `mirror` (mirror empty dirs both ways, with
   create/delete propagated via the index). Ignored for git remotes, which
   cannot store empty directories.
+- **`max_file_size`** — largest file synced in either direction; bigger files
+  are skipped (logged at debug level). Resolved per-sync → per-remote →
+  `[daemon]`. Accepts a byte count or a size string (`"100MB"`, `"512KiB"`;
+  decimal units are ×1000, binary `…iB` units ×1024). `0` (or unset) means
+  unlimited. Defaults to `100MB`.
 - **Conflicts (newer-wins)** — if a file changed on both sides, the newer mtime
   wins and the losing version is preserved next to it as
   `name.conflux-conflict-YYYY-MM-DD_HH-MM-SS.ext` (local time; and logged). These
