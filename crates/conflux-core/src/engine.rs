@@ -109,6 +109,77 @@ impl From<&SyncReport> for SyncSummary {
     }
 }
 
+/// A single planned change produced by a dry run: what would happen to one path
+/// and in which direction, without performing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedChange {
+    /// The affected path, relative to the sync root.
+    pub path: RelPath,
+    /// What the sync would do to it.
+    pub op: PlanOp,
+}
+
+/// The operation a dry run predicts for a path. Directions are from the local
+/// tree's point of view: `Push`/upload sends local → remote, `Pull`/download
+/// brings remote → local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanOp {
+    /// Upload local → remote.
+    Push {
+        /// False when the remote has no copy yet (a create rather than an edit).
+        update: bool,
+    },
+    /// Download remote → local.
+    Pull {
+        /// False when the local tree has no copy yet (a create rather than an edit).
+        update: bool,
+    },
+    /// Delete the local file (it was removed on the remote).
+    DeleteLocal,
+    /// Delete the remote file (it was removed locally).
+    DeleteRemote,
+    /// Both sides changed: newer-wins would keep `winner` and save the other as
+    /// a conflict copy. Predicted from mtimes; the actual run may find the two
+    /// sides identical and do nothing.
+    Conflict {
+        /// The side newer-wins predicts will be kept.
+        winner: Winner,
+    },
+    /// Pull-only path whose local copy diverged: the remote overwrites it, the
+    /// local version kept as a conflict copy.
+    PullPreserveLocal,
+    /// Push-only path whose remote copy diverged: the local overwrites it, the
+    /// remote version kept as a local conflict copy.
+    PushPreserveRemote,
+    /// The file would be skipped because it exceeds `max_file_size`.
+    OversizeSkip {
+        /// The size of the file that would be skipped, in bytes.
+        size: u64,
+    },
+    /// Create an empty directory locally (empty-dir mirroring).
+    CreateLocalDir,
+    /// Create an empty directory on the remote (empty-dir mirroring).
+    CreateRemoteDir,
+    /// Remove an empty directory locally.
+    DeleteLocalDir,
+    /// Remove an empty directory on the remote.
+    DeleteRemoteDir,
+}
+
+/// The full set of changes a sync would make, computed without applying them.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SyncPlan {
+    /// Every planned change, in path order (files first, then empty dirs).
+    pub changes: Vec<PlannedChange>,
+}
+
+impl SyncPlan {
+    /// Whether the sync would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
 /// A stable, human-readable label for a sync group (`remote:remote_path`, or
 /// just `remote` when the group maps to the remote's root).
 pub fn group_label(sync: &Sync) -> String {
@@ -153,6 +224,38 @@ pub fn run(
     )?;
     index.save(&index_path)?;
     Ok(report)
+}
+
+/// Read-only companion to [`run`]: build the backend, load the baseline index,
+/// and compute what a manual sync *would* do — without writing to the local
+/// tree, pushing to the remote, or persisting the index.
+///
+/// It still fetches the remote snapshot (so a git backend refreshes its private
+/// clone), which is what makes the preview reflect the current remote state; it
+/// never calls the backend's `finalize` (commit/push).
+#[allow(clippy::too_many_arguments)]
+pub fn plan(
+    sync: &Sync,
+    remote: &Remote,
+    state_dir: &Path,
+    empty_dirs: EmptyDirMode,
+    deletions: Deletions,
+    max_file_size: u64,
+    exclude_defaults: &[String],
+) -> Result<SyncPlan> {
+    let backend = crate::backend::build(remote, sync, state_dir)?;
+    let index_path = Index::path_for(state_dir, sync);
+    let index = Index::load(&index_path)?;
+    plan_group(
+        sync,
+        backend.as_ref(),
+        &index,
+        empty_dirs,
+        sync.scope,
+        deletions,
+        max_file_size,
+        exclude_defaults,
+    )
 }
 
 /// How a side changed relative to the baseline.
@@ -232,6 +335,36 @@ fn apply_deletions_policy(action: Action, deletions: Deletions) -> Action {
     }
 }
 
+/// Decide the action for one path from its per-side changes and sync mode, then
+/// apply the group's deletions policy. Shared by [`sync_group`] (which applies
+/// the result) and [`plan_group`] (which only reports it), so a dry run can
+/// never disagree with the real sync.
+fn decide_key(
+    mode: KeyMode,
+    remote_refresh: bool,
+    local_change: Change,
+    remote_change: Change,
+    local_present: bool,
+    remote_present: bool,
+    deletions: Deletions,
+) -> Action {
+    let action = match mode {
+        // Bidirectional file during a background pull: apply only remote-side
+        // changes; leave local edits/deletes to the bidirectional trigger.
+        KeyMode::Bidir if remote_refresh => decide_remote_refresh(local_change, remote_change),
+        KeyMode::Bidir => decide_bidir(local_change, remote_change),
+        KeyMode::PullOnly => decide_pull_only(local_change, remote_change, local_present),
+        // A background remote poll never pushes, so a push-only file is left for
+        // its normal (local-driven) trigger.
+        KeyMode::PushOnly if remote_refresh => Action::Nothing,
+        KeyMode::PushOnly => decide_push_only(local_change, remote_change, remote_present),
+        KeyMode::Skip => Action::Nothing,
+    };
+    // `deletions = deny` neutralizes every file deletion, in either direction
+    // and regardless of scope, so a removal on one side is never propagated.
+    apply_deletions_policy(action, deletions)
+}
+
 /// If `action` would transfer a file whose size exceeds `limit`, return that
 /// size (so the caller can skip and log it). `limit == 0` means no cap. Actions
 /// that move no bytes (deletes, index-only, nothing) are never capped. A
@@ -307,27 +440,15 @@ pub fn sync_group(
             base.as_ref().map(|b| b.remote_id.as_str()),
         );
 
-        let action = match mode {
-            // Bidirectional file during a background pull: apply only remote-side
-            // changes; leave local edits/deletes to the bidirectional trigger.
-            KeyMode::Bidir if remote_refresh => decide_remote_refresh(local_change, remote_change),
-            KeyMode::Bidir => decide_bidir(local_change, remote_change),
-            KeyMode::PullOnly => {
-                decide_pull_only(local_change, remote_change, local.contains_key(&key))
-            }
-            // A background remote poll never pushes, so a push-only file is left
-            // for its normal (local-driven) trigger.
-            KeyMode::PushOnly if remote_refresh => Action::Nothing,
-            KeyMode::PushOnly => {
-                decide_push_only(local_change, remote_change, remote.contains_key(&key))
-            }
-            KeyMode::Skip => unreachable!("skipped above"),
-        };
-
-        // `deletions = deny` neutralizes every file deletion, in either
-        // direction and regardless of scope, so a removal on one side is never
-        // propagated to the other.
-        let action = apply_deletions_policy(action, deletions);
+        let action = decide_key(
+            mode,
+            remote_refresh,
+            local_change,
+            remote_change,
+            local.contains_key(&key),
+            remote.contains_key(&key),
+            deletions,
+        );
 
         // Skip files whose transfer would exceed the configured size cap, in
         // either direction. The index is left untouched, so the file simply
@@ -364,6 +485,164 @@ pub fn sync_group(
 
     backend.finalize()?;
     Ok(report)
+}
+
+/// Compute, without applying, what [`sync_group`] would do for a manual sync:
+/// the set of per-path changes and their direction. It reads the local tree and
+/// the remote snapshot but never writes, deletes, pushes, or mutates the index.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_group(
+    sync: &Sync,
+    backend: &dyn Backend,
+    index: &Index,
+    empty_dirs: EmptyDirMode,
+    scope: Scope,
+    deletions: Deletions,
+    max_file_size: u64,
+    exclude_defaults: &[String],
+) -> Result<SyncPlan> {
+    let exclude = Matcher::new(&sync.effective_excludes(exclude_defaults), false)?;
+    let include = Matcher::new(&sync.include, false)?;
+
+    let local = scan_local(&sync.local, &exclude)?;
+    let mut remote = backend.snapshot()?;
+    remote.retain(|path, _| !exclude.is_match(path));
+
+    let mut plan = SyncPlan::default();
+
+    for key in union_keys(&local, &remote, index) {
+        let mode = key_mode(scope, include.is_match(&key));
+        if mode == KeyMode::Skip {
+            continue;
+        }
+
+        let base = index.get(&key);
+        let local_change = classify(
+            local.get(&key).map(|m| m.hash.as_str()),
+            base.map(|b| b.local_hash.as_str()),
+        );
+        let remote_change = classify(
+            remote.get(&key).map(|m| m.id.as_str()),
+            base.map(|b| b.remote_id.as_str()),
+        );
+
+        // A manual dry run mirrors a manual sync: full bidirectional, never a
+        // background remote-refresh poll.
+        let action = decide_key(
+            mode,
+            false,
+            local_change,
+            remote_change,
+            local.contains_key(&key),
+            remote.contains_key(&key),
+            deletions,
+        );
+
+        if let Some(size) = oversize(action, &local, &remote, &key, max_file_size) {
+            plan.changes.push(PlannedChange {
+                path: key,
+                op: PlanOp::OversizeSkip { size },
+            });
+            continue;
+        }
+
+        if let Some(op) = plan_op(action, &key, &local, &remote) {
+            plan.changes.push(PlannedChange { path: key, op });
+        }
+    }
+
+    if empty_dirs != EmptyDirMode::Ignore && backend.supports_empty_dirs() {
+        plan_dirs(sync, backend, index, empty_dirs, &mut plan)?;
+    }
+
+    Ok(plan)
+}
+
+/// Map an applied [`Action`] to the user-facing dry-run [`PlanOp`], or `None`
+/// for actions with no observable effect (nothing / index-only bookkeeping).
+fn plan_op(
+    action: Action,
+    key: &RelPath,
+    local: &BTreeMap<RelPath, FileMeta>,
+    remote: &crate::backend::RemoteSnapshot,
+) -> Option<PlanOp> {
+    Some(match action {
+        Action::Nothing | Action::DropIndex => return None,
+        Action::Push | Action::ResurrectPush => PlanOp::Push {
+            update: remote.contains_key(key),
+        },
+        Action::Pull | Action::ResurrectPull => PlanOp::Pull {
+            update: local.contains_key(key),
+        },
+        Action::DeleteLocal => PlanOp::DeleteLocal,
+        Action::DeleteRemote => PlanOp::DeleteRemote,
+        Action::Conflict => {
+            let winner = match (local.get(key), remote.get(key)) {
+                (Some(l), Some(r)) if newer_is_local(l, r) => Winner::Local,
+                _ => Winner::Remote,
+            };
+            PlanOp::Conflict { winner }
+        }
+        Action::PullPreserveLocal => PlanOp::PullPreserveLocal,
+        Action::PushPreserveRemote => PlanOp::PushPreserveRemote,
+    })
+}
+
+/// Predict the empty-directory changes for a dry run, mirroring the logic of
+/// [`mirror_dirs`]/[`prune_dirs`] but read-only. Pruning is reported first-order
+/// (a parent that would only become empty after its child is pruned is not
+/// followed here).
+fn plan_dirs(
+    sync: &Sync,
+    backend: &dyn Backend,
+    index: &Index,
+    mode: EmptyDirMode,
+    plan: &mut SyncPlan,
+) -> Result<()> {
+    match mode {
+        EmptyDirMode::Ignore => {}
+        EmptyDirMode::Mirror => {
+            let local = crate::backend::walk_empty_dirs(&sync.local)?;
+            let remote = backend.snapshot_dirs()?;
+            let mut union: BTreeSet<RelPath> = BTreeSet::new();
+            union.extend(local.iter().cloned());
+            union.extend(remote.iter().cloned());
+            for d in &index.dirs {
+                if let Some(rel) = RelPath::from_relative(Path::new(d)) {
+                    union.insert(rel);
+                }
+            }
+            for dir in union {
+                let op = match (
+                    local.contains(&dir),
+                    remote.contains(&dir),
+                    index.dirs.contains(dir.as_str()),
+                ) {
+                    (true, false, false) => PlanOp::CreateRemoteDir,
+                    (false, true, false) => PlanOp::CreateLocalDir,
+                    (true, false, true) => PlanOp::DeleteLocalDir,
+                    (false, true, true) => PlanOp::DeleteRemoteDir,
+                    _ => continue,
+                };
+                plan.changes.push(PlannedChange { path: dir, op });
+            }
+        }
+        EmptyDirMode::Prune => {
+            for dir in crate::backend::walk_empty_dirs(&sync.local)? {
+                plan.changes.push(PlannedChange {
+                    path: dir,
+                    op: PlanOp::DeleteLocalDir,
+                });
+            }
+            for dir in backend.snapshot_dirs()? {
+                plan.changes.push(PlannedChange {
+                    path: dir,
+                    op: PlanOp::DeleteRemoteDir,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Handle empty directories after the file reconciliation, per `empty_dirs` mode.

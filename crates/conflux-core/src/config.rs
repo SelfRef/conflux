@@ -139,6 +139,17 @@ pub struct Remote {
     /// Optional command whose stdout yields the password.
     #[serde(default)]
     pub password_command: Option<String>,
+    /// Git-over-SSH only (optional): path to a private key file (e.g. a deploy
+    /// key) to authenticate with. Tried before `~/.ssh/config` identities,
+    /// ssh-agent, and the default keys. `~` is expanded.
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    /// Git-over-SSH only (optional): command whose stdout is the raw private key
+    /// material (like `password_command`, but for an SSH key). Handy for
+    /// fetching a deploy key from a secret store without writing it to disk,
+    /// e.g. `identity_file_command = "cat /run/secrets/deploy_key"`.
+    #[serde(default)]
+    pub identity_file_command: Option<String>,
     /// Git branch; defaults to the remote's default branch when omitted.
     #[serde(default)]
     pub branch: Option<String>,
@@ -341,6 +352,16 @@ impl Config {
                     remote.backend.as_str(),
                 )));
             }
+            if (remote.identity_file.is_some() || remote.identity_file_command.is_some())
+                && remote.backend != RemoteKind::Git
+            {
+                return Err(Error::Validation(format!(
+                    "remote `{}` sets `identity_file`/`identity_file_command`, which only apply \
+                     to a `git` backend, but its backend is `{}`",
+                    remote.id,
+                    remote.backend.as_str(),
+                )));
+            }
         }
 
         let mut labels = HashSet::new();
@@ -431,6 +452,8 @@ impl Remote {
             username: None,
             password: None,
             password_command: None,
+            identity_file: None,
+            identity_file_command: None,
             branch: None,
             commit_msg_command: None,
             pull_interval: None,
@@ -460,6 +483,29 @@ impl Remote {
         } else {
             Ok(self.password.clone())
         }
+    }
+
+    /// Resolve `identity_file_command`: run it and return its stdout as raw SSH
+    /// private key material, or `None` when the option is unset. Unlike a
+    /// password, key material is not trimmed — a private key ends with a
+    /// trailing newline that libssh2 requires.
+    pub fn resolve_identity_file_command(&self) -> Result<Option<String>> {
+        let Some(cmd) = &self.identity_file_command else {
+            return Ok(None);
+        };
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .map_err(|e| Error::Backend(format!("identity_file_command failed to run: {e}")))?;
+        if !output.status.success() {
+            return Err(Error::Backend(format!(
+                "identity_file_command exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
     }
 }
 
@@ -994,6 +1040,33 @@ mod tests {
             backend = "filesystem"
             url = "/tmp/mirror"
             commit_msg_command = "printf hi"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_identity_file_on_non_git_backend() {
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "m"
+            backend = "webdav"
+            url = "https://dav.example.com/"
+            identity_file = "~/.ssh/deploy_key"
+        "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+
+        let err = Config::from_toml_str(
+            r#"
+            [[remote]]
+            id = "m"
+            backend = "webdav"
+            url = "https://dav.example.com/"
+            identity_file_command = "cat key"
         "#,
         )
         .unwrap_err();

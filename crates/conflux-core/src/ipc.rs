@@ -5,7 +5,7 @@
 //! (sync, in the CLI) and server (async, in the daemon); only the types are
 //! shared here.
 
-use crate::engine::SyncSummary;
+use crate::engine::{SyncPlan, SyncSummary};
 use serde::{Deserialize, Serialize};
 
 /// A command sent from the CLI to the daemon.
@@ -15,6 +15,8 @@ pub enum Request {
     Status,
     /// Run a sync now for the given target.
     Sync(SyncTarget),
+    /// Compute, without applying, what a sync of the target would do (dry run).
+    Plan(SyncTarget),
     /// Re-read and apply the configuration file.
     Reload,
 }
@@ -37,6 +39,8 @@ pub enum Response {
     Status(Vec<GroupStatus>),
     /// Outcome of a sync request, one entry per group run.
     Synced(Vec<GroupOutcome>),
+    /// Result of a dry-run request, one entry per targeted group.
+    Planned(Vec<GroupPlan>),
     /// Result of a reload.
     Reloaded {
         /// Whether the reload succeeded.
@@ -74,6 +78,17 @@ pub struct GroupOutcome {
     pub label: String,
     /// Summary on success.
     pub summary: Option<SyncSummary>,
+    /// Error message on failure.
+    pub error: Option<String>,
+}
+
+/// The dry-run result for a single group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupPlan {
+    /// Group label (`remote:remote_path`).
+    pub label: String,
+    /// The computed plan on success.
+    pub plan: Option<SyncPlan>,
     /// Error message on failure.
     pub error: Option<String>,
 }

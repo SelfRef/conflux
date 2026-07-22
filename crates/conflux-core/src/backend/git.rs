@@ -32,6 +32,22 @@ pub struct GitBackend {
     username: Option<String>,
     password: Option<String>,
     commit_msg_command: Option<String>,
+    /// SSH credentials to try, in order, for this remote's host. Precomputed
+    /// once so the credentials callback can iterate them across libgit2's
+    /// retry attempts.
+    ssh_creds: Vec<SshCred>,
+}
+
+/// One SSH credential candidate the credentials callback can offer.
+#[derive(Clone)]
+enum SshCred {
+    /// Ask a running ssh-agent for a key.
+    Agent,
+    /// A private key file on disk (from `identity_file`, `~/.ssh/config`, or a
+    /// default location).
+    KeyFile(PathBuf),
+    /// Raw private key material held in memory (from `identity_file_command`).
+    KeyInline(String),
 }
 
 impl GitBackend {
@@ -50,6 +66,7 @@ impl GitBackend {
             username: remote.username.clone(),
             password: remote.resolve_password()?,
             commit_msg_command: remote.commit_msg_command.clone(),
+            ssh_creds: ssh_credentials(remote)?,
         })
     }
 
@@ -92,10 +109,42 @@ impl GitBackend {
     fn callbacks(&self) -> RemoteCallbacks<'_> {
         let user = self.username.clone();
         let pass = self.password.clone();
+        // Candidate SSH keys/agent to offer. If none were resolved (e.g. an
+        // HTTPS remote, or an SSH host with no keys on disk), fall back to the
+        // agent so behaviour is unchanged for the agent-only case.
+        let ssh_creds = if self.ssh_creds.is_empty() {
+            vec![SshCred::Agent]
+        } else {
+            self.ssh_creds.clone()
+        };
+        // libgit2 calls the credentials callback repeatedly, once per auth
+        // attempt, until one succeeds (or a credential is reused). We walk
+        // `ssh_creds` one entry per SSH_KEY invocation so each key/agent gets a
+        // turn instead of retrying the same one forever.
+        let mut ssh_attempt = 0usize;
         let mut cb = RemoteCallbacks::new();
         cb.credentials(move |_url, username_from_url, allowed| {
+            let ssh_user = username_from_url.unwrap_or("git");
+            // Some SSH servers first ask only for the username.
+            if allowed.contains(CredentialType::USERNAME) {
+                return Cred::username(ssh_user);
+            }
             if allowed.contains(CredentialType::SSH_KEY) {
-                return Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"));
+                let attempt = ssh_attempt;
+                ssh_attempt += 1;
+                return match ssh_creds.get(attempt) {
+                    Some(SshCred::Agent) => Cred::ssh_key_from_agent(ssh_user),
+                    Some(SshCred::KeyFile(path)) => Cred::ssh_key(ssh_user, None, path, None),
+                    Some(SshCred::KeyInline(key)) => {
+                        Cred::ssh_key_from_memory(ssh_user, None, key, None)
+                    }
+                    // Every candidate has been tried; stop retrying so libgit2
+                    // surfaces the auth failure instead of looping.
+                    None => Err(git2::Error::from_str(
+                        "no more SSH credentials to try (checked ssh-agent, \
+                         ~/.ssh/config identities, and default keys)",
+                    )),
+                };
             }
             if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
                 if let Some(p) = &pass {
@@ -249,6 +298,216 @@ fn gerr(op: &'static str) -> impl Fn(git2::Error) -> Error {
     move |e| Error::Backend(format!("git {op} failed: {e}"))
 }
 
+/// Build the ordered list of SSH credentials to try for a `remote`.
+///
+/// libgit2/libssh2 does not read `~/.ssh/config`, so conflux resolves keys
+/// itself. Order (most to least specific):
+///   1. `identity_file` / `identity_file_command` from the remote's config
+///   2. `IdentityFile`s configured for the host in `~/.ssh/config`
+///   3. ssh-agent
+///   4. default key locations (`~/.ssh/id_ed25519`, `id_rsa`, ...)
+///
+/// The config-derived entries (2–4) are only added for SSH URLs; explicit
+/// deploy keys (1) are honoured regardless. Fails if `identity_file` points at
+/// a missing path or `identity_file_command` errors.
+fn ssh_credentials(remote: &Remote) -> Result<Vec<SshCred>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut creds = Vec::new();
+
+    // 1a. Explicit deploy key on disk (highest priority).
+    if let Some(raw) = &remote.identity_file {
+        let path = PathBuf::from(shellexpand::tilde(raw).into_owned());
+        if !path.is_file() {
+            return Err(Error::Validation(format!(
+                "remote '{}': identity_file not found: {}",
+                remote.id,
+                path.display()
+            )));
+        }
+        if seen.insert(path.clone()) {
+            creds.push(SshCred::KeyFile(path));
+        }
+    }
+    // 1b. Deploy key fetched via command (raw key material).
+    if let Some(key) = remote.resolve_identity_file_command()? {
+        creds.push(SshCred::KeyInline(key));
+    }
+
+    // The remaining candidates only apply to SSH remotes.
+    if let Some(host) = ssh_host_from_url(&remote.url) {
+        // 2. Keys the user picked for this host in ~/.ssh/config.
+        for path in ssh_config_identity_files(&host) {
+            if path.is_file() && seen.insert(path.clone()) {
+                creds.push(SshCred::KeyFile(path));
+            }
+        }
+        // 3. ssh-agent (keeps the previous behaviour working unchanged).
+        creds.push(SshCred::Agent);
+        // 4. Default key locations that actually exist.
+        for path in default_identity_files() {
+            if path.is_file() && seen.insert(path.clone()) {
+                creds.push(SshCred::KeyFile(path));
+            }
+        }
+    }
+    Ok(creds)
+}
+
+/// Extract the SSH host from a git remote URL, or `None` if it isn't SSH.
+/// Handles `ssh://[user@]host[:port]/path` and scp-like `[user@]host:path`.
+fn ssh_host_from_url(url: &str) -> Option<String> {
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let authority = rest.split('/').next().unwrap_or(rest);
+        return Some(strip_host(authority));
+    }
+    // Any other explicit scheme (https://, http://, git://, file://) is not SSH.
+    if url.contains("://") {
+        return None;
+    }
+    // scp-like syntax: user@host:path — the host is everything before the
+    // first colon, which must not contain a path separator.
+    if let Some((authority, _)) = url.split_once(':') {
+        if !authority.is_empty() && !authority.contains('/') {
+            return Some(strip_host(authority));
+        }
+    }
+    None
+}
+
+/// Reduce a URL authority (`[user@]host[:port]`, incl. `[ipv6]:port`) to the
+/// bare host.
+fn strip_host(authority: &str) -> String {
+    // Drop any `user@` prefix (rsplit so an `@` in userinfo can't confuse it).
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    // Bracketed IPv6 literal: return what's inside the brackets.
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    // Strip a trailing `:port` (only when it's numeric, so we don't mangle a
+    // bare IPv6 address that has no brackets).
+    match host.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            h.to_string()
+        }
+        _ => host.to_string(),
+    }
+}
+
+/// The `IdentityFile` paths that apply to `host`, read from `~/.ssh/config`
+/// with `~` expanded. Empty if the file is missing or unreadable.
+fn ssh_config_identity_files(host: &str) -> Vec<PathBuf> {
+    let path = shellexpand::tilde("~/.ssh/config").into_owned();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    parse_identity_files(&text, host)
+        .into_iter()
+        .map(|f| PathBuf::from(shellexpand::tilde(&f).into_owned()))
+        .collect()
+}
+
+/// Parse an ssh_config `text` and return the raw (un-expanded) `IdentityFile`
+/// tokens that apply to `host`.
+///
+/// Supports `Host` blocks with `*`/`?` wildcards and `!` negation, and options
+/// before the first `Host` (which apply to every host). Other keywords —
+/// `Match`, `Include`, `Hostname`, etc. — are ignored.
+fn parse_identity_files(text: &str, host: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    // Options before the first `Host` line apply to all hosts.
+    let mut matching = true;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (keyword, rest) = split_config_line(line);
+        match keyword.to_ascii_lowercase().as_str() {
+            "host" => matching = host_matches(host, rest),
+            "identityfile" if matching => {
+                files.extend(rest.split_whitespace().map(str::to_string));
+            }
+            _ => {}
+        }
+    }
+    files
+}
+
+/// Split an ssh_config line into `(keyword, rest)`, allowing either whitespace
+/// or `=` (optionally surrounded by spaces) as the separator.
+fn split_config_line(line: &str) -> (&str, &str) {
+    let end = line
+        .find(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or(line.len());
+    let keyword = &line[..end];
+    let rest = line[end..].trim_start();
+    let rest = rest.strip_prefix('=').map(str::trim_start).unwrap_or(rest);
+    (keyword, rest)
+}
+
+/// Whether `host` matches any positive pattern in a `Host` line's `patterns`
+/// while matching no negated (`!`) pattern.
+fn host_matches(host: &str, patterns: &str) -> bool {
+    let mut matched = false;
+    for pat in patterns.split_whitespace() {
+        if let Some(neg) = pat.strip_prefix('!') {
+            if glob_match(neg, host) {
+                return false;
+            }
+        } else if glob_match(pat, host) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// Match `text` against an ssh_config host `pattern` supporting `*` (any run)
+/// and `?` (single char). Case-insensitive, like OpenSSH.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let txt: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    // Iterative wildcard match with backtracking on `*`.
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while t < txt.len() {
+        if p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == '*' {
+            star = Some(p);
+            mark = t;
+            p += 1;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// Default private-key locations OpenSSH would try, in preference order.
+fn default_identity_files() -> Vec<PathBuf> {
+    [
+        "id_ed25519",
+        "id_ecdsa",
+        "id_ecdsa_sk",
+        "id_ed25519_sk",
+        "id_rsa",
+        "id_dsa",
+    ]
+    .iter()
+    .map(|name| PathBuf::from(shellexpand::tilde(&format!("~/.ssh/{name}")).into_owned()))
+    .collect()
+}
+
 /// Make a filesystem-safe directory name from a remote name.
 fn sanitize(name: &str) -> String {
     name.chars()
@@ -277,4 +536,135 @@ fn hostname() -> Option<String> {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let name = String::from_utf8_lossy(&buf[..end]).into_owned();
     (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_ssh_host_from_url_forms() {
+        assert_eq!(
+            ssh_host_from_url("ssh://git@git.aperte.dev:222/SelfRef/test.git").as_deref(),
+            Some("git.aperte.dev")
+        );
+        assert_eq!(
+            ssh_host_from_url("ssh://git.example.com/repo.git").as_deref(),
+            Some("git.example.com")
+        );
+        // scp-like syntax.
+        assert_eq!(
+            ssh_host_from_url("git@github.com:me/dots.git").as_deref(),
+            Some("github.com")
+        );
+        // Bracketed IPv6 with a port.
+        assert_eq!(
+            ssh_host_from_url("ssh://git@[2001:db8::1]:2222/repo.git").as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn non_ssh_urls_have_no_host() {
+        assert_eq!(ssh_host_from_url("https://github.com/me/dots.git"), None);
+        assert_eq!(ssh_host_from_url("http://example.com/repo.git"), None);
+        assert_eq!(ssh_host_from_url("git://example.com/repo.git"), None);
+        assert_eq!(ssh_host_from_url("file:///srv/repo.git"), None);
+        // A bare local path is not an scp target.
+        assert_eq!(ssh_host_from_url("/srv/git/repo.git"), None);
+    }
+
+    #[test]
+    fn glob_matches_wildcards() {
+        assert!(glob_match("git.aperte.dev", "git.aperte.dev"));
+        assert!(glob_match("*.aperte.dev", "git.aperte.dev"));
+        assert!(glob_match("git.*", "git.aperte.dev"));
+        assert!(glob_match("*", "anything.at.all"));
+        assert!(glob_match("git?.example.com", "git1.example.com"));
+        assert!(!glob_match("git?.example.com", "git.example.com"));
+        assert!(!glob_match("*.aperte.dev", "git.example.com"));
+        // Case-insensitive, like OpenSSH.
+        assert!(glob_match("Git.Aperte.Dev", "git.aperte.dev"));
+    }
+
+    #[test]
+    fn host_line_negation_excludes() {
+        assert!(host_matches("git.aperte.dev", "*.aperte.dev"));
+        assert!(!host_matches(
+            "secret.aperte.dev",
+            "*.aperte.dev !secret.aperte.dev"
+        ));
+        assert!(host_matches(
+            "public.aperte.dev",
+            "*.aperte.dev !secret.aperte.dev"
+        ));
+    }
+
+    #[test]
+    fn parses_identity_file_for_matching_host() {
+        let config = "\
+# a comment
+Host github.com
+    IdentityFile ~/.ssh/github_key
+
+Host git.aperte.dev
+    User git
+    IdentityFile ~/.ssh/gitea_selfref
+";
+        assert_eq!(
+            parse_identity_files(config, "git.aperte.dev"),
+            vec!["~/.ssh/gitea_selfref"]
+        );
+        assert_eq!(
+            parse_identity_files(config, "github.com"),
+            vec!["~/.ssh/github_key"]
+        );
+        // A host with no matching block gets nothing.
+        assert!(parse_identity_files(config, "unknown.example.com").is_empty());
+    }
+
+    #[test]
+    fn parses_wildcard_and_multiple_identity_files() {
+        let config = "\
+Host *.aperte.dev
+    IdentityFile ~/.ssh/aperte_a
+    IdentityFile ~/.ssh/aperte_b
+";
+        assert_eq!(
+            parse_identity_files(config, "git.aperte.dev"),
+            vec!["~/.ssh/aperte_a", "~/.ssh/aperte_b"]
+        );
+    }
+
+    #[test]
+    fn parses_equals_separator_and_global_options() {
+        // Options before the first `Host` apply to every host; `=` is a valid
+        // separator.
+        let config = "\
+IdentityFile=~/.ssh/global_key
+
+Host git.aperte.dev
+    IdentityFile = ~/.ssh/host_key
+";
+        assert_eq!(
+            parse_identity_files(config, "git.aperte.dev"),
+            vec!["~/.ssh/global_key", "~/.ssh/host_key"]
+        );
+        assert_eq!(
+            parse_identity_files(config, "other.example.com"),
+            vec!["~/.ssh/global_key"]
+        );
+    }
+
+    #[test]
+    fn keyword_matching_is_case_insensitive() {
+        let config = "\
+host git.aperte.dev
+    identityfile ~/.ssh/gitea_selfref
+";
+        assert_eq!(
+            parse_identity_files(config, "git.aperte.dev"),
+            vec!["~/.ssh/gitea_selfref"]
+        );
+    }
 }

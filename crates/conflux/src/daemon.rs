@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use conflux_core::config::{Remote, Sync};
 use conflux_core::engine::{self, group_label, SyncSummary};
-use conflux_core::ipc::{GroupOutcome, GroupStatus, Request, Response, SyncTarget};
+use conflux_core::ipc::{GroupOutcome, GroupPlan, GroupStatus, Request, Response, SyncTarget};
 use conflux_core::model::{Deletions, EmptyDirMode, RemoteKind};
 use conflux_core::{Config, Paths};
 use notify::{RecursiveMode, Watcher};
@@ -309,6 +309,59 @@ async fn run_one(
     })
 }
 
+/// Compute a dry-run plan for one group without applying it. Like [`run_one`] it
+/// takes the daemon-wide sync lock (so it sees a consistent snapshot and never
+/// races a real sync), but it makes no changes and records no status.
+async fn plan_one(
+    state: &Shared,
+    sync_lock: &Arc<tokio::sync::Mutex<()>>,
+    label: &str,
+) -> Option<GroupPlan> {
+    let (sync, remote, state_dir, empty_dirs, deletions, max_file_size, exclude_defaults) = {
+        let st = state.lock().unwrap();
+        let (sync, remote, state_dir) = resolve(&st, label)?;
+        let empty_dirs = resolve_empty_dirs(&st.config, &sync);
+        let deletions = resolve_deletions(&st.config, &sync);
+        let max_file_size = resolve_max_file_size(&st.config, &sync);
+        let exclude_defaults = st.config.daemon.exclude.clone();
+        (
+            sync,
+            remote,
+            state_dir,
+            empty_dirs,
+            deletions,
+            max_file_size,
+            exclude_defaults,
+        )
+    };
+
+    let _guard = sync_lock.lock().await;
+    debug!(group = %label, "computing dry-run plan");
+    let join = tokio::task::spawn_blocking(move || {
+        engine::plan(
+            &sync,
+            &remote,
+            &state_dir,
+            empty_dirs,
+            deletions,
+            max_file_size,
+            &exclude_defaults,
+        )
+    })
+    .await;
+
+    let (plan, error) = match join {
+        Ok(Ok(p)) => (Some(p), None),
+        Ok(Err(e)) => (None, Some(e.to_string())),
+        Err(e) => (None, Some(format!("plan task failed: {e}"))),
+    };
+    Some(GroupPlan {
+        label: label.to_string(),
+        plan,
+        error,
+    })
+}
+
 /// Spawn timer and watch trigger tasks for every active group.
 fn spawn_triggers(state: &Shared, submit: &Submitter) -> Triggers {
     let mut triggers = Triggers::default();
@@ -532,6 +585,23 @@ async fn handle_conn(
                 }
                 let _ = submit; // manual syncs run inline; queue unused here
                 Response::Synced(outcomes)
+            }
+        }
+        Ok(Request::Plan(target)) => {
+            let labels = {
+                let st = state.lock().unwrap();
+                labels_for_target(&st, &target)
+            };
+            if labels.is_empty() {
+                Response::Error("no matching sync groups".into())
+            } else {
+                let mut plans = Vec::new();
+                for label in labels {
+                    if let Some(p) = plan_one(state, sync_lock, &label).await {
+                        plans.push(p);
+                    }
+                }
+                Response::Planned(plans)
             }
         }
         Ok(Request::Reload) => {

@@ -148,6 +148,37 @@ trigger = "timer"
 interval = "15m"
 ```
 
+For a Git remote over **SSH** (`ssh://git@host/…` or `git@host:…`), conflux
+authenticates with, in order:
+
+1. `identity_file` / `identity_file_command` on the `[[remote]]` (see below),
+2. the `IdentityFile`(s) configured for the host in `~/.ssh/config`,
+3. `ssh-agent`,
+4. the default keys (`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`, …).
+
+So for an interactive machine, adding
+
+```
+Host git.example.com
+    IdentityFile ~/.ssh/my_key
+```
+
+to `~/.ssh/config` is enough — no per-remote key setting is needed. For a
+headless daemon or a CI/deploy-key setup, point the remote straight at a key:
+
+```toml
+[[remote]]
+id = "test"
+backend = "git"
+url = "ssh://git@git.example.com:222/me/test.git"
+identity_file = "~/.ssh/deploy_key"
+# …or fetch the raw key material from a secret store, like password_command:
+# identity_file_command = "cat /run/secrets/deploy_key"
+```
+
+conflux reads `IdentityFile` itself; the more exotic `~/.ssh/config` directives
+such as `ProxyJump`, `Hostname`/`Port` rewriting, and `Include` are not applied.
+
 A `~/Documents` tree mirrored 1:1 to WebDAV (e.g. Nextcloud), with deletions
 propagated both ways so the two copies stay identical:
 
@@ -255,6 +286,12 @@ sudo systemctl enable --now conflux@desktop
 To run the daemon in the foreground instead (for debugging), run
 `conflux daemon` directly; set `CONFLUX_LOG=debug` for verbose output.
 
+**The daemon syncs every active group once at startup**, regardless of each
+group's `trigger` — `manual` only disables *automatic* (timer/watch) triggers
+after that initial run. So starting or reloading the daemon performs a real
+sync immediately; there is no "start paused" mode. Keep this in mind when first
+enabling a group (see the dry-run note below).
+
 ### CLI commands
 
 The CLI talks to the running daemon over its control socket. Add `--system` for
@@ -264,8 +301,26 @@ a system daemon and `--profile <name>` to target a specific profile.
 conflux status              # show each sync group and its last run
 conflux sync                # trigger a sync now for every group
 conflux sync dotfiles       # trigger just one group (by id or remote:path)
+conflux sync --dry-run      # preview what a sync would change, changing nothing
+conflux sync dotfiles -n    # dry-run a single group
 conflux reload              # reload the config without restarting
 conflux config validate     # check the config file
 conflux config show         # print the resolved config
 conflux config paths        # print config/state/socket paths
 ```
+
+`sync --dry-run` (`-n`) lists the changes the next sync would make without
+performing any — one line per path, prefixed with `↑` upload, `↓` download, `✗`
+delete, `!` conflict (with the newer-wins winner), or `·` skip. It fetches the
+current remote state to compare against but never writes, deletes, or pushes.
+Conflicts are predicted from modification times, so a file the sync later finds
+identical on both sides is shown as a conflict but would resolve to no change.
+
+Because it goes through the daemon, `--dry-run` previews the *next* sync of an
+already-running daemon — i.e. changes you have made since the last sync. It is
+**not** a way to preview a brand-new group before its first sync: the daemon
+already synced that group when it started (see above). To vet a new group's
+direction and filters safely, first bring it up in a throwaway setup — point
+`--config` at a temp file whose `[[sync]]` uses a local scratch directory (or a
+`filesystem` remote), start `conflux daemon` in the foreground, edit files, and
+watch `--dry-run` — before pointing it at real data.

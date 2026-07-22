@@ -53,6 +53,9 @@ enum Command {
         /// Sync to run, by its `id` or `remote:remote_path` label; omit to run
         /// every group of this profile.
         group: Option<String>,
+        /// Show what the sync would change, without changing anything.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     /// Reload the daemon configuration.
     Reload,
@@ -135,12 +138,17 @@ fn run(cli: &Cli, log_reload: &LogReload) -> anyhow::Result<ExitCode> {
             let response = control::send(&paths.socket, &Request::Status)?;
             Ok(exit_code(control::print_response(&response)))
         }
-        Command::Sync { group } => {
+        Command::Sync { group, dry_run } => {
             let target = match group {
                 Some(g) => SyncTarget::Group(g.clone()),
                 None => SyncTarget::All,
             };
-            let response = control::send(&paths.socket, &Request::Sync(target))?;
+            let request = if *dry_run {
+                Request::Plan(target)
+            } else {
+                Request::Sync(target)
+            };
+            let response = control::send(&paths.socket, &request)?;
             Ok(exit_code(control::print_response(&response)))
         }
         Command::Reload => {

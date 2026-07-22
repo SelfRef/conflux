@@ -102,6 +102,15 @@
 # password_command = 'printf %s "$CONFLUX_PASSWORD"'         # from an env var
 # # (The daemon inherits the environment of the process that started it.)
 #
+# # Git over SSH (optional): conflux authenticates with, in order, `identity_file`
+# # / `identity_file_command` below, then the `IdentityFile`(s) for the host in
+# # ~/.ssh/config, then ssh-agent, then the default keys (~/.ssh/id_ed25519, ...).
+# # For most setups an ~/.ssh/config entry is enough and neither option is needed.
+# identity_file = "~/.ssh/deploy_key"                    # a private key on disk
+# # Or fetch the raw key material from a command's stdout (like password_command),
+# # e.g. from a secret store, without writing it to disk:
+# identity_file_command = "cat /run/secrets/deploy_key"
+#
 # # Git only (optional): branch to track; defaults to the remote's default branch.
 # branch = "main"
 #
